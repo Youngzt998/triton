@@ -356,6 +356,7 @@ class CodeGenerator(ast.NodeVisitor):
         # Are we currently visiting an ast.arg's default value?  These have some
         # special handling.
         self.visiting_arg_default_value = False
+        self.defined_name = None
 
     builtin_namespace: Dict[str, Any] = {
         _.__name__: _
@@ -676,9 +677,13 @@ class CodeGenerator(ast.NodeVisitor):
             return value
 
         targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
-        self.builder.set_loc_def_name(node.targets[0].id)
 
+        # operations of right hand side of assignment will be built after walking through the following self.visit(node.value)
+        # we temporarily store the name of defined globally, and delete it after finishing the
+        self.defined_name = node.targets[0].id
         values = _sanitize_value(self.visit(node.value))
+        self.defined_name = None
+
         assert len(targets) == 1
         target = targets[0]
         if isinstance(target, ast.Name):
