@@ -682,7 +682,6 @@ class CodeGenerator(ast.NodeVisitor):
         # we temporarily store the name of defined globally, and delete it after finishing the
         self.defined_name = node.targets[0].id
         values = _sanitize_value(self.visit(node.value))
-        self.defined_name = None
 
         assert len(targets) == 1
         target = targets[0]
