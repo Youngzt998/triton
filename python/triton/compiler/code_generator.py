@@ -356,6 +356,7 @@ class CodeGenerator(ast.NodeVisitor):
         # Are we currently visiting an ast.arg's default value?  These have some
         # special handling.
         self.visiting_arg_default_value = False
+        # A global varibale to indicate whether current node defined a name (otherwise None)
         self.defined_name = None
 
     builtin_namespace: Dict[str, Any] = {
@@ -676,6 +677,10 @@ class CodeGenerator(ast.NodeVisitor):
                 value = self.semantic.to_tensor(value)
             return value
 
+        # temporarily store the defined name globally,
+        # and delete it after finishing the visit of child nodes
+        self.defined_name = node.targets[0].id
+        values = _sanitize_value(self.visit(node.value))
         targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
 
         # operations of right hand side of assignment will be built after walking through the following self.visit(node.value)
