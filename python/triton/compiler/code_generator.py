@@ -676,6 +676,8 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(target, ast.Attribute):
             raise NotImplementedError("Attribute assignment is not supported in triton")
         assert isinstance(target, ast.Name)
+        if knobs.compilation.dump_source_var_name:
+            print(f'Triton Source Value Name: {target.id}')
         self.set_value(self.visit(target), value)
 
     def visit_Assign(self, node):
