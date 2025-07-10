@@ -273,7 +273,7 @@ class HIPBackend(BaseBackend):
         return mod
 
     @staticmethod
-    def make_llir(src, metadata, options):
+    def make_llvmir(src, metadata, options):
         mod = src
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
@@ -318,6 +318,8 @@ class HIPBackend(BaseBackend):
             HIPBackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
 
         if not knobs.compilation.disable_line_info:
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
             passes.llvmir.add_di_scope(pm)
 
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, __HIP_FTZ)
