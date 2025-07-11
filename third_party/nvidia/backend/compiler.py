@@ -332,7 +332,7 @@ class CUDABackend(BaseBackend):
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
-    def make_llir(self, src, metadata, options, capability):
+    def make_llvmir(self, src, metadata, options, capability):
         ptx_version = get_ptx_version_from_options(options, self.target.arch)
 
         mod = src
@@ -363,6 +363,8 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         passes.convert.add_nvvm_to_llvm(pm)
         if not knobs.compilation.disable_line_info:
+            pm = ir.pass_manager(mod.context)
+            pm.enable_debug()
             passes.llvmir.add_di_scope(pm)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
