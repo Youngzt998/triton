@@ -25,8 +25,8 @@ public:
                             std::optional<Value> ctaId, Value val,
                             Value pred) const = 0;
   virtual Value loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
-                            std::optional<Value> ctaId, Type elemTy,
-                            Value pred) const = 0;
+                            std::optional<Value> ctaId, Type elemTy, Value pred,
+                            Operation *localLoadOp = nullptr) const = 0;
 
   void storeShared(RewriterBase &rewriter, Location loc, Value ptr, Value val,
                    Value pred) const {
@@ -37,15 +37,6 @@ public:
     return loadDShared(rewriter, loc, ptr, /*ctaId=*/std::nullopt, elemTy,
                        pred);
   }
-
-  virtual bool canUseStMatrix(RankedTensorType tensorTy,
-                              ArrayRef<unsigned> repShape,
-                              ArrayRef<unsigned> paddedRepShape,
-                              ArrayRef<unsigned> order,
-                              int swizzleByteSize) const = 0;
-
-  virtual void storeMatrixShared(RewriterBase &rewriter, Location loc,
-                                 Value ptr, Value val) const = 0;
 
   virtual Value shuffleXor(RewriterBase &rewriter, Location loc, Value val,
                            int i) const = 0;
@@ -98,11 +89,6 @@ public:
   virtual bool supportStMatrix() const { return false; }
   virtual bool isCuda() const { return false; }
 
-  // Annotate target specific information to local store operations during
-  // lowering to LLVM.
-  virtual void localStoreOpAnnotation(triton::gpu::LocalStoreOp op,
-                                      size_t localStoreOpCount,
-                                      Type type) const {}
   // Annotate target specific information to local load operations during
   // lowering to LLVM. `llLoadOp` is the generated LLVM load op.
   virtual void localLoadOpAnnotation(triton::gpu::LocalLoadOp localLoadOp,

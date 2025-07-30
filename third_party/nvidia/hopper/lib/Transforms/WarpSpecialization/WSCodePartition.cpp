@@ -19,6 +19,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/PipeliningUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
+#include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include <unordered_set>
 
 namespace tt = mlir::triton;
@@ -554,7 +555,7 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
   auto barrierEncoding = ttg::SwizzledSharedEncodingAttr::get(
       context, 1, 1, 1, {0}, barrierCTALayout);
   Type barrierMemDescType = ttg::MemDescType::get(
-      {distance}, builder.getI64Type(), barrierEncoding, sharedMemorySpace,
+      {distance, 1}, builder.getI64Type(), barrierEncoding, sharedMemorySpace,
       /*mutableMemory=*/true);
   Type singleBarrierMemDescType =
       ttg::MemDescType::get({1}, builder.getI64Type(), barrierEncoding,
@@ -563,7 +564,7 @@ static Value createBarrierAlloc(triton::FuncOp funcOp, unsigned distance) {
       loc, barrierMemDescType, Value());
   for (unsigned i = 0; i < distance; i++) {
     Value idx = builder.create<arith::ConstantIntOp>(loc, i, 32);
-    Value barrierView = builder.create<ttg::MemDescSubviewOp>(
+    Value barrierView = builder.create<ttg::MemDescIndexOp>(
         loc, singleBarrierMemDescType, barrierAlloc, idx);
     builder.create<ttng::InitBarrierOp>(funcOp->getLoc(), barrierView, 1);
   }
@@ -725,9 +726,18 @@ DenseMap<Channel *, Value> createBuffer(
     auto &channels = channelsGroupedByProducers[channelInOrder];
     auto srcValue = channelInOrder->getSrcOperand();
     auto srcOp = channelInOrder->getSrcOp();
+    auto dstOp = channelInOrder->getDstOp();
     auto *channel = channels.front();
     unsigned numBuffers = channel->numBuffers;
     Value buffer;
+
+    LLVM_DEBUG({
+      LDBG("Creating buffers for channel:");
+      LDBG("Producer:");
+      DBGS() << *srcOp << "\n";
+      LDBG("Consumer:");
+      DBGS() << *dstOp << "\n";
+    });
 
     // For TMEM channel, multi-buffer TMEM alloc
     if (channel->channelKind == DataChannelKind::TMEM) {
@@ -745,8 +755,34 @@ DenseMap<Channel *, Value> createBuffer(
 
       // Get shape, layout and type of a slice
       auto sliceShape = tensorType.getShape();
-      auto sharedLayout = ttg::NVMMASharedEncodingAttr::get(
-          context, sliceShape, order, CTALayout, elemType, /*fp4Padded*/ false);
+      // Check the consumer type
+      auto actualConsumers = getActualConsumers(dstOp);
+      LLVM_DEBUG({
+        DBGS() << "actual consumers: \n";
+        for (auto consumerOp : actualConsumers) {
+          DBGS() << *consumerOp << "\n";
+        }
+      });
+
+      bool requireMMASharedEncoding =
+          llvm::any_of(actualConsumers, [](Operation *op) {
+            return isa<mlir::triton::DotOpInterface>(op);
+          });
+
+      Attribute sharedLayout;
+      if (requireMMASharedEncoding) {
+        sharedLayout = ttg::NVMMASharedEncodingAttr::get(
+            context, sliceShape, order, CTALayout, elemType,
+            /*fp4Padded*/ false);
+      } else if (auto tmaLoad = dyn_cast<tt::DescriptorLoadOp>(srcOp)) {
+        sharedLayout = ttng::getEncodingFromDescriptor(
+            tmaLoad, tmaLoad.getType(), tmaLoad.getDesc());
+      } else {
+        // Create an unswizzled layout for now.
+        // TODO: optimize it based on the consumer.
+        sharedLayout = ttg::SwizzledSharedEncodingAttr::get(context, 1, 1, 1,
+                                                            order, CTALayout);
+      }
 
       // Get shape, layout and type of the complete buffer
       SmallVector<int64_t> bufferShape(sliceShape.begin(), sliceShape.end());
@@ -790,6 +826,7 @@ desyncTCGen5MMAOp(OpBuilderWithAsyncTaskIds &builder, ttng::TCGen5MMAOp mmaOp,
   auto pred = builder.createWithAsyncTaskIds<arith::ConstantIntOp>(
       mmaOp->getLoc(), true, 1);
   mmaOp.addCompletionBarrier(consumerBarrier, pred);
+  mmaOp.setIsAsync(true);
 
   // Create a wait_barrier before the producer.
   builder.setInsertionPoint(headProducer);
@@ -1178,8 +1215,7 @@ void foldLocalLoads(triton::FuncOp funcOp) {
                                               kv.getSecond());
 }
 
-void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers,
-                     unsigned requestedRegisters) {
+void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers) {
   // Step 1: collect all communications between producers and consumers.
   SmallVector<std::unique_ptr<Channel>> channelsOrigin;
   collectAsyncChannels(channelsOrigin, funcOp, numBuffers);
@@ -1269,7 +1305,7 @@ void doCodePartition(triton::FuncOp &funcOp, unsigned numBuffers,
     funcOp.dump();
   });
 
-  specializeRegion(funcOp, requestedRegisters);
+  specializeRegion(funcOp, 0 /*requestedRegisters*/);
   LLVM_DEBUG({
     LDBG("\n\nwith specializeRegion");
     funcOp.dump();
@@ -1288,7 +1324,7 @@ public:
   void runOnFuncOp(triton::FuncOp funcOp) {
     // Disable code partitioning when numBuffers is 0.
     if (numBuffers > 0)
-      doCodePartition(funcOp, numBuffers, requestedRegisters);
+      doCodePartition(funcOp, numBuffers);
   }
   void runOnOperation() override {
     getOperation()->walk([&](triton::FuncOp funcOp) { runOnFuncOp(funcOp); });

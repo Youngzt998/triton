@@ -1,12 +1,19 @@
+# isort: off
+# fmt: off
 import torch
 import triton
 import triton.language as tl
 from triton_kernels import target_info
-from triton_kernels.numerics_details.mxfp import unswizzle_mx_scale_bw, get_scaled_dot_format_string
-from triton_kernels.numerics_details.flexpoint import float_to_flex, load_scale, nan_propagating_absmax_reduce, compute_scale
-from ._common import make_matmul_repr, matmul_launch_metadata, swizzle2d, xcd_swizzle
+from triton_kernels.tensor_details.layout_details.blackwell_scale import unswizzle_mx_scale_bw
+from triton_kernels.numerics_details.flexpoint import (
+    float_to_flex,
+    load_scale,
+    nan_propagating_absmax_reduce,
+    compute_scale,
+)
+from triton_kernels.numerics_details.mxfp_details._downcast_to_mxfp import MXFP_BLOCK_SIZE
+from ._common import make_matmul_repr, matmul_launch_metadata, swizzle2d, xcd_swizzle, get_scaled_dot_format_string
 
-# fmt: off
 
 @tl.constexpr_function
 def cuda_capability_geq(major, minor):
@@ -96,17 +103,20 @@ def _load_writeback_idx_and_mask(WriteBackIndx, writeback_size, offs, mask):
 
 
 _matmul_ogs_repr = make_matmul_repr("_p_matmul_ogs", [0, 1, 2])
-@triton.jit(repr=_matmul_ogs_repr, launch_metadata=matmul_launch_metadata)
+@triton.jit(do_not_specialize=["TOKENS_PER_EXPT_FOR_ANNOTATION"],
+            repr=_matmul_ogs_repr, launch_metadata=matmul_launch_metadata)
 def _p_matmul_ogs(
              Y, Out, stride_y_k, stride_y_z, stride_y_m, stride_y_n,
              YExpectedScale, YActualScale, YChecksumScale,
-             X, stride_x_z, stride_x_m, stride_x_k,
+             stride_y_mx_z, stride_y_mx_m, stride_y_mx_n,
+             X, XPtr, stride_x_z, stride_x_m, stride_x_k,
              XScale,
+             XMxScale, stride_x_mx_z, stride_x_mx_m, stride_x_mx_k,
              W, stride_w_e, stride_w_k, stride_w_n, W_TRANSPOSE: tl.constexpr,
              WScale,
-             MxScale, stride_mx_e, stride_mx_k, stride_mx_n, MX_TRANSPOSE: tl.constexpr,
+             MxScale, stride_mx_e, stride_mx_k, stride_mx_n,
              B, stride_b_e, # Bias
-             M, N, K, # shapes
+             NRows, M, N, K, # shapes
              # expt data
              Betas, Gammas,
              GatherIndx,
@@ -141,19 +151,20 @@ def _p_matmul_ogs(
              TOKENS_PER_EXPT_FOR_ANNOTATION=None,
              UPCAST_INDICES:tl.constexpr=False,
              DISABLE_Y_TMA: tl.constexpr=False,
-             SWAP_XW: tl.constexpr = False):
+             SWAP_XW: tl.constexpr = False,
+             IS_EPILOGUE_DEQUANT_MXFP8: tl.constexpr = False):
     tl.static_assert(SWIZZLE_MX_VALUE is None, "NYI. Value swizzling")
     Y = Out  # Y is passed for the purposes of annotation; replace it with Out
 
     is_microscaled_format: tl.constexpr = MxScale is not None
-    MX_PACK_DIVISOR: tl.constexpr = 32
+    MX_PACK_DIVISOR: tl.constexpr = MXFP_BLOCK_SIZE
     if is_microscaled_format:
         w_type: tl.constexpr = get_dtype(W)
         tl.static_assert(w_type == tl.uint8 or (w_type == tl.float8e4nv or w_type == tl.float8e5),
                          "mx_weight_ptr must be uint8")
         tl.static_assert(get_dtype(MxScale) == tl.uint8, "mx_scale_ptr must be uint8")
         tl.static_assert(BLOCK_K % MX_PACK_DIVISOR == 0, "BLOCK_K must be a multiple of MX_PACK_DIVISOR")
-        tl.static_assert(SWIZZLE_MX_SCALE == "BLACKWELL" or SWIZZLE_MX_SCALE is None, "Only Blackwell swizzling is supported for scales")
+        tl.static_assert(SWIZZLE_MX_SCALE == "BLACKWELL_SCALE" or SWIZZLE_MX_SCALE is None, "Only Blackwell swizzling is supported for scales")
 
         # We have pack 2 fp4 values in a byte
         W_PACK_DIVISOR: tl.constexpr = 2 if w_type == tl.uint8 else 1
@@ -210,13 +221,6 @@ def _p_matmul_ogs(
     X_USE_LOAD_TMA: tl.constexpr = GatherIndx is None and isinstance(X, tl.tensor_descriptor)
     USE_SCATTER_TMA: tl.constexpr = (cuda_capability_geq(10, 0) and HAS_FUSED_SCATTER) and not DISABLE_Y_TMA
     INT_MAX: tl.constexpr = 2147483647
-
-    if USE_GATHER_TMA:
-        X = tl.make_tensor_descriptor(X,
-            shape=[INT_MAX, K],
-            strides=[stride_x_m, stride_x_k],
-            block_shape=[1, BLOCK_K]
-        )
 
     if USE_SCATTER_TMA:
         y_desc = tl.make_tensor_descriptor(
@@ -313,13 +317,13 @@ def _p_matmul_ogs(
                     x_scales: tl.constexpr = None
                 else:
                     x_scales = tl.full((BLOCK_M, BLOCK_K // MX_PACK_DIVISOR), 127, dtype=tl.uint8)
-                if SWIZZLE_MX_SCALE == "BLACKWELL":
+                if SWIZZLE_MX_SCALE == "BLACKWELL_SCALE":
                     flattened_expt_n_idx = expt_id * ((N + 127) // 128) + (off_n // 128)
                     w_scales = MxScale.load([0, flattened_expt_n_idx, pid_k * MX_SCALE_BLOCK_K // 4 + ki * (MX_SCALE_BLOCK_K // 4 * SPLIT_K), 0, 0])
                     w_scales = w_scales.reshape((w_scales.shape[1], w_scales.shape[2] * w_scales.shape[-2] * w_scales.shape[-1]))
                     w_scales = unswizzle_mx_scale_bw(w_scales)
                 else:
-                    w_scales = _tma_load_2d(MxScale, [expt_id, off_k_mx, off_n], transpose=MX_TRANSPOSE).T
+                    w_scales = _tma_load_2d(MxScale, [expt_id, off_k_mx, off_n]).T
                 if SWAP_XW:
                     acc = tl.dot_scaled(w.T, w_scales, mx_format, x.T, x_scales, x_format, acc=acc, fast_math=True)
                 else:
@@ -384,6 +388,17 @@ def _p_matmul_ogs(
                 block_shape=[BLOCK_M, OUT_BLOCK_N],
             )
 
+        # bias + scale
+        offs_y_n = off_n1 + tl.arange(0, BLOCK_N)
+        mask_n = offs_y_n < N
+        if B is not None:
+            BPtrs = B + expt_id1 * stride_b_e + offs_y_n
+            if pid_k1 == 0:
+                bias = tl.load(BPtrs, mask=mask_n, other=0)
+            else:
+                bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
+        else:
+            bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
         if Betas is not None:
             betas = tl.load(Betas + start_m1 + offs_m, mask=mask_m, other=0.0)
         else:
@@ -399,15 +414,21 @@ def _p_matmul_ogs(
             w_scale = load_scale(WScale)
 
         accs = (acc,)
+        biases = (bias,)
 
         if SUBTILE_FACTOR >= 2:
             acc0, acc1 = acc.reshape(BLOCK_M, 2, BLOCK_N // 2).permute(0, 2, 1).split()
             accs = (acc0, acc1)
+            bias0, bias1 = bias.reshape(2, BLOCK_N // 2).permute(1, 0).split()
+            biases = (bias0, bias1)
 
         if SUBTILE_FACTOR >= 4:
             acc00, acc01 = acc0.reshape(BLOCK_M, 2, BLOCK_N // 4).permute(0, 2, 1).split()
             acc10, acc11 = acc1.reshape(BLOCK_M, 2, BLOCK_N // 4).permute(0, 2, 1).split()
             accs = (acc00, acc01, acc10, acc11)
+            bias00, bias01 = bias0.reshape(2, BLOCK_N // 4).permute(1, 0).split()
+            bias10, bias11 = bias1.reshape(2, BLOCK_N // 4).permute(1, 0).split()
+            biases = (bias00, bias01, bias10, bias11)
 
         tl.static_assert(EPILOGUE_BLOCK_N == BLOCK_N // SUBTILE_FACTOR)
         tl.static_assert(len(accs) == SUBTILE_FACTOR)
@@ -419,18 +440,7 @@ def _p_matmul_ogs(
             if SWAP_XW:
                 acc_tile = acc_tile.T
 
-            if B is not None:
-                offs_y_n = off_n1 + EPILOGUE_BLOCK_N * a_i + tl.arange(0, EPILOGUE_BLOCK_N)
-                mask_n = offs_y_n < N
-                BPtrs = B + expt_id1 * stride_b_e + offs_y_n
-                if pid_k1 == 0:
-                    bias = tl.load(BPtrs, mask=mask_n, other=0)
-                else:
-                    bias = tl.full([EPILOGUE_BLOCK_N], 0, dtype=tl.float32)
-            else:
-                bias = tl.full([EPILOGUE_BLOCK_N], 0, dtype=tl.float32)
-
-            acc_tile = acc_tile + bias[None, :] * betas[:, None]
+            acc_tile = acc_tile + biases[a_i][None, :] * betas[:, None]
             if out_alpha is not None:
                 acc_tile *= out_alpha
 

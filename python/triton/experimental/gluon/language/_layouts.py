@@ -1,29 +1,61 @@
 from dataclasses import dataclass
 from typing import List, Optional
-from triton.language.core import _unwrap_if_constexpr, _unwrap_shape
+from triton.language.core import _unwrap_if_constexpr, _unwrap_shape, constexpr_type
 
 __all__ = [
+    "AutoLayout",
     "BlockedLayout",
     "SliceLayout",
     "DistributedLinearLayout",
+    "NVMMADistributedLayout",
     "NVMMASharedLayout",
     "SwizzledSharedLayout",
 ]
 
 
-def _realize_cta_layout(rank, ctas_per_cga, cta_split_num, cta_order):
-    ctas_per_cga = ctas_per_cga or [1] * rank
-    cta_split_num = cta_split_num or [1] * rank
-    cta_order = cta_order or list(reversed(range(rank)))
-    return ctas_per_cga, cta_split_num, cta_order
+def _realize_cta_layout(layout, rank):
+    ctas_per_cga = layout.ctas_per_cga or [1] * rank
+    cta_split_num = layout.cta_split_num or [1] * rank
+    cta_order = layout.cta_order or list(reversed(range(rank)))
+    object.__setattr__(layout, "ctas_per_cga", ctas_per_cga)
+    object.__setattr__(layout, "cta_split_num", cta_split_num)
+    object.__setattr__(layout, "cta_order", cta_order)
 
 
 class DistributedLayout:
-    pass
+    """
+    Base class for distributed memory layouts in Gluon IR.
+    """
+
+    @property
+    def type(self):
+        return constexpr_type(self)
+
+
+@dataclass(frozen=True)
+class AutoLayout(DistributedLayout):
+
+    def _to_ir(self, builder):
+        return builder.get_auto_layout()
+
+    def mangle(self):
+        return "AL"
 
 
 @dataclass(frozen=True)
 class BlockedLayout(DistributedLayout):
+    """
+    Represents a blocked layout, partitioning a tensor across threads, warps, and CTAs.
+
+    Args:
+        size_per_thread (List[int]): Number of elements per thread per dimension.
+        threads_per_warp (List[int]): Number of threads per warp per dimension.
+        warps_per_cta (List[int]): Number of warps per CTA per dimension.
+        order (List[int]): The ordering of dimensions for partitioning.
+        ctas_per_cga (Optional[List[int]]): CTAs per CGA grouping.
+        cta_split_num (Optional[List[int]]): Split factors for CTAs.
+        cta_order (Optional[List[int]]): Ordering for CTAs.
+    """
     size_per_thread: List[int]
     threads_per_warp: List[int]
     warps_per_cta: List[int]
@@ -42,25 +74,23 @@ class BlockedLayout(DistributedLayout):
         super().__setattr__("cta_order", _unwrap_if_constexpr(self.cta_order))
 
         rank = len(self.size_per_thread)
+        _realize_cta_layout(self, rank)
         assert len(self.threads_per_warp) == rank
         assert len(self.warps_per_cta) == rank
         assert len(self.order) == rank
-        assert self.ctas_per_cga is None or len(self.ctas_per_cga) == rank
-        assert self.cta_split_num is None or len(self.cta_split_num) == rank
-        assert self.cta_order is None or len(self.cta_order) == rank
+        assert len(self.ctas_per_cga) == rank
+        assert len(self.cta_split_num) == rank
+        assert len(self.cta_order) == rank
 
     def _to_ir(self, builder):
-        rank = len(self.size_per_thread)
-        ctas_per_cga, cta_split_num, cta_order = _realize_cta_layout(rank, self.ctas_per_cga, self.cta_split_num,
-                                                                     self.cta_order)
         return builder.get_blocked_layout(
             self.size_per_thread,
             self.threads_per_warp,
             self.warps_per_cta,
             self.order,
-            ctas_per_cga,
-            cta_split_num,
-            cta_order,
+            self.ctas_per_cga,
+            self.cta_split_num,
+            self.cta_order,
         )
 
     def mangle(self) -> str:
@@ -82,6 +112,13 @@ class BlockedLayout(DistributedLayout):
 
 @dataclass(frozen=True)
 class SliceLayout(DistributedLayout):
+    """
+    Represents a layout corresponding to slicing a distributed tensor along one dimension.
+
+    Args:
+        dim (int): The dimension index to slice.
+        parent (DistributedLayout): The parent layout before slicing.
+    """
     dim: int
     parent: DistributedLayout
 
@@ -101,6 +138,17 @@ class SliceLayout(DistributedLayout):
 
 @dataclass(frozen=True)
 class DistributedLinearLayout(DistributedLayout):
+    """
+    Represents a linear distributed layout with explicit bases at register, lane, warp, and block levels.
+    See: https://arxiv.org/abs/2505.23819 for reference.
+
+    Args:
+        reg_bases (List[List[int]]): Bases for register-level distribution.
+        lane_bases (List[List[int]]): Bases for lane-level distribution.
+        warp_bases (List[List[int]]): Bases for warp-level distribution.
+        block_bases (List[List[int]]): Bases for block-level distribution.
+        shape (List[int]): The tensor global shape.
+    """
     reg_bases: List[List[int]]
     lane_bases: List[List[int]]
     warp_bases: List[List[int]]
@@ -133,12 +181,82 @@ class DistributedLinearLayout(DistributedLayout):
         return f"DLL{self.reg_bases}_{self.lane_bases}_{self.warp_bases}_{self.block_bases}_{self.shape}DLL"
 
 
+@dataclass(frozen=True)
+class NVMMADistributedLayout(DistributedLayout):
+    """
+    Represents a layout for NVIDIA MMA (tensor core) operations.
+
+    Args:
+        version (List[int]): Version identifier for the MMA instruction.
+        warps_per_cta (List[int]): Number of warps per CTA.
+        instr_shape (List[int]): Instruction shape for MMA.
+        ctas_per_cga (Optional[List[int]]): CTAs per CGA grouping.
+        cta_split_num (Optional[List[int]]): Split factors for CTAs.
+        cta_order (Optional[List[int]]): CTA ordering.
+    """
+    version: List[int]
+    warps_per_cta: List[int]
+    instr_shape: List[int]
+    ctas_per_cga: Optional[List[int]] = None
+    cta_split_num: Optional[List[int]] = None
+    cta_order: Optional[List[int]] = None
+
+    def __post_init__(self):
+        super().__setattr__("version", _unwrap_if_constexpr(self.version))
+        super().__setattr__("warps_per_cta", _unwrap_if_constexpr(self.warps_per_cta))
+        super().__setattr__("instr_shape", _unwrap_if_constexpr(self.instr_shape))
+        super().__setattr__("ctas_per_cga", _unwrap_if_constexpr(self.ctas_per_cga))
+        super().__setattr__("cta_split_num", _unwrap_if_constexpr(self.cta_split_num))
+        super().__setattr__("cta_order", _unwrap_if_constexpr(self.cta_order))
+
+        rank = 2
+        _realize_cta_layout(self, rank)
+        assert len(self.ctas_per_cga) == rank
+        assert len(self.cta_split_num) == rank
+        assert len(self.cta_order) == rank
+
+    def _to_ir(self, builder):
+        return builder.get_mma_layout(self.version, self.warps_per_cta, self.ctas_per_cga, self.cta_split_num,
+                                      self.cta_order, self.instr_shape)
+
+    def mangle(self) -> str:
+        return f"MMA_{self.version}_{self.warps_per_cta}_{self.instr_shape}_{self.ctas_per_cga}_{self.cta_split_num}_{self.cta_order}_MMA"
+
+
 class SharedLayout:
-    pass
+    """
+    Base class for shared memory layouts in Gluon IR.
+    """
+
+    @property
+    def type(self):
+        return constexpr_type(self)
+
+
+def _get_shape_per_cta(shape, cta_split_num):
+    shape_per_cta = shape
+    if cta_split_num is not None:
+        assert len(cta_split_num) == len(shape)
+        for dim in range(len(shape_per_cta)):
+            shape_per_cta[dim] /= cta_split_num[dim]
+    return shape_per_cta
 
 
 @dataclass(frozen=True)
 class NVMMASharedLayout(SharedLayout):
+    """
+    Represents a layout for shared memory suitable for NVIDIA MMA operations.
+
+    Args:
+        swizzle_byte_width (int): Width in bytes for swizzling.
+        element_bitwidth (int): Bitwidth of element type.
+        rank (int): Rank of the tensor.
+        transposed (bool): Whether the layout is transposed.
+        fp4_padded (bool): Whether FP4 padding is used.
+        ctas_per_cga (Optional[List[int]]): CTAs per CGA grouping.
+        cta_split_num (Optional[List[int]]): Split factors for CTAs.
+        cta_order (Optional[List[int]]): CTA ordering.
+    """
     swizzle_byte_width: int
     element_bitwidth: int
     rank: int
@@ -161,21 +279,61 @@ class NVMMASharedLayout(SharedLayout):
         assert self.element_bitwidth in [8, 16, 32, 64]
         assert self.swizzle_byte_width in [0, 32, 64, 128]
         rank = self.rank
-        assert self.ctas_per_cga is None or len(self.ctas_per_cga) == rank
-        assert self.cta_split_num is None or len(self.cta_split_num) == rank
-        assert self.cta_order is None or len(self.cta_order) == rank
+        _realize_cta_layout(self, rank)
+        assert len(self.ctas_per_cga) == rank
+        assert len(self.cta_split_num) == rank
+        assert len(self.cta_order) == rank
 
     def _to_ir(self, builder):
-        ctas_per_cga, cta_split_num, cta_order = _realize_cta_layout(self.rank, self.ctas_per_cga, self.cta_split_num,
-                                                                     self.cta_order)
         return builder.get_nvmma_shared_layout(
             self.swizzle_byte_width,
             self.element_bitwidth,
             self.transposed,
             self.fp4_padded,
-            ctas_per_cga,
-            cta_split_num,
-            cta_order,
+            self.ctas_per_cga,
+            self.cta_split_num,
+            self.cta_order,
+        )
+
+    @staticmethod
+    def get_default_for(block_shape, dtype, transposed=False, fp4_padded=False, ctas_per_cga=None, cta_split_num=None,
+                        cta_order=None):
+        """Returns an NVMMASharedLayout with default swizzling for a given shape.
+
+        This picks the largest swizzle pattern compatible with the shape, which
+        allows emitting the fewest TMA or MMA messages.
+        """
+        packing_factor = 2 if fp4_padded else 1
+        shape_per_cta = _get_shape_per_cta(block_shape, cta_split_num)
+        rank = len(block_shape)
+        if transposed:
+            shape_per_cta = shape_per_cta[1:] + shape_per_cta[:1]
+        contig_dim_size = shape_per_cta[-1] * packing_factor
+        contig_dim_bytes = contig_dim_size * dtype.primitive_bitwidth // 8
+        if contig_dim_bytes >= 128 and contig_dim_bytes % 128 == 0:
+            swizzle_byte_width = 128
+        elif contig_dim_bytes >= 64 and contig_dim_bytes % 64 == 0:
+            swizzle_byte_width = 64
+        elif contig_dim_bytes >= 32 and contig_dim_bytes % 32 == 0:
+            swizzle_byte_width = 32
+        else:
+            swizzle_byte_width = 0
+
+        flatten_outer_dim = 1
+        for size in shape_per_cta[:-1]:
+            flatten_outer_dim *= size
+        if len(block_shape) < 2 or flatten_outer_dim < 8:
+            swizzle_byte_width = 0
+
+        return NVMMASharedLayout(
+            swizzle_byte_width=swizzle_byte_width,
+            element_bitwidth=dtype.primitive_bitwidth,
+            rank=rank,
+            transposed=transposed,
+            fp4_padded=fp4_padded,
+            ctas_per_cga=ctas_per_cga,
+            cta_split_num=cta_split_num,
+            cta_order=cta_order,
         )
 
     def mangle(self) -> str:
@@ -184,6 +342,18 @@ class NVMMASharedLayout(SharedLayout):
 
 @dataclass(frozen=True, eq=True)
 class SwizzledSharedLayout(SharedLayout):
+    """
+    Represents a generic swizzled shared memory layout.
+
+    Args:
+        vec (int): Vector width for swizzling.
+        per_phase (int): Elements per swizzle phase.
+        max_phase (int): Maximum number of swizzle phases.
+        order (List[int]): Dimension ordering for swizzling.
+        ctas_per_cga (Optional[List[int]]): CTAs per CGA grouping.
+        cta_split_num (Optional[List[int]]): Split factors for CTAs.
+        cta_order (Optional[List[int]]): CTA ordering.
+    """
     vec: int
     per_phase: int
     max_phase: int
@@ -202,22 +372,20 @@ class SwizzledSharedLayout(SharedLayout):
         super().__setattr__("cta_order", _unwrap_if_constexpr(self.cta_order))
 
         rank = len(self.order)
-        assert self.ctas_per_cga is None or len(self.ctas_per_cga) == rank
-        assert self.cta_split_num is None or len(self.cta_split_num) == rank
-        assert self.cta_order is None or len(self.cta_order) == rank
+        _realize_cta_layout(self, rank)
+        assert len(self.ctas_per_cga) == rank
+        assert len(self.cta_split_num) == rank
+        assert len(self.cta_order) == rank
 
     def _to_ir(self, builder):
-        rank = len(self.order)
-        ctas_per_cga, cta_split_num, cta_order = _realize_cta_layout(rank, self.ctas_per_cga, self.cta_split_num,
-                                                                     self.cta_order)
         return builder.get_swizzled_shared_layout(
-            _unwrap_if_constexpr(self.vec),
-            _unwrap_if_constexpr(self.per_phase),
-            _unwrap_if_constexpr(self.max_phase),
+            self.vec,
+            self.per_phase,
+            self.max_phase,
             self.order,
-            ctas_per_cga,
-            cta_split_num,
-            cta_order,
+            self.ctas_per_cga,
+            self.cta_split_num,
+            self.cta_order,
         )
 
     def mangle(self) -> str:

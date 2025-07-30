@@ -1,6 +1,7 @@
 #include "Utility.h"
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "TritonAMDGPUToLLVM/GCNAsmFormat.h"
+#include "TritonAMDGPUToLLVM/TargetUtils.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
 #include "mlir/IR/PatternMatch.h"
@@ -137,8 +138,17 @@ static Value shuffleCommonImpl(Location loc, RewriterBase &rewriter,
       Value lineId = b.xor_(threadId, stride);
       return bpermute(lineId);
     } else if (strideInt == 16) {
-      Value offset = b.i32_val(0x401F);
-      return rewriter.create<ROCDL::DsSwizzleOp>(loc, valType, val, offset);
+      if (isRDNA(isaFamily)) {
+        // Lane i in the upper 16 lanes reads the value from lane i in the lower
+        // 16 lanes and vice versa.
+        Value select_lo = b.i32_val(0x76543210);
+        Value select_hi = b.i32_val(0xfedcba98);
+        return rewriter.create<ROCDL::PermlaneX16Op>(
+            loc, valType, val, val, select_lo, select_hi, true, false);
+      } else {
+        Value offset = b.i32_val(0x401F);
+        return rewriter.create<ROCDL::DsSwizzleOp>(loc, valType, val, offset);
+      }
     } else {
       if (!llvm::is_contained({ISAFamily::CDNA2, ISAFamily::CDNA3,
                                ISAFamily::CDNA4, ISAFamily::RDNA3},
@@ -287,7 +297,8 @@ Value llGetPid(Location loc, RewriterBase &rewriter, ModuleOp moduleOp,
 }
 
 Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
-             Value pred, Value falseVal, triton::CacheModifier cm) {
+             Value pred, Value falseVal, triton::CacheModifier cm,
+             bool forceNoAliasAsyncLoads) {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
 
   Type funcType = getFunctionType(elemTy, ValueRange({ptr, pred, falseVal}));
@@ -306,10 +317,13 @@ Value llLoad(RewriterBase &rewriter, Location loc, Value ptr, Type elemTy,
       return predicatedLoad;
     }
   };
+  std::string funcName = getLoadNameRaw(cm);
+  if (forceNoAliasAsyncLoads)
+    funcName += noAliasAsyncLoads;
 
-  auto funcName = mangleFunc(getLoadNameRaw(cm), funcType);
+  auto mangledName = mangleFunc(funcName, funcType);
   LLVM::LLVMFuncOp funcOp =
-      appendOrGetExternFuncOp(rewriter, parent, funcName, funcType);
+      appendOrGetExternFuncOp(rewriter, parent, mangledName, funcType);
   return LLVM::createLLVMCallOp(rewriter, loc, funcOp,
                                 ValueRange({ptr, pred, falseVal}))
       .getResult();
@@ -541,8 +555,7 @@ unsigned getContiguity(Value ptr, Value offset,
   // FIXME (Alex): this should not be needed anymore because it's done inside
   // getContiguity, but we have an order issues with LL, so we keep this
   // until the LL order issue is fixed
-  auto layout = tensorTy.getEncoding();
-  auto linearLayout = triton::gpu::toLinearLayout(tensorTy.getShape(), layout);
+  auto linearLayout = triton::gpu::toLinearLayout(tensorTy);
   auto llAttr =
       triton::gpu::LinearEncodingAttr::get(tensorTy.getContext(), linearLayout);
   auto order = triton::gpu::getOrder(tensorTy);
@@ -698,5 +711,4 @@ bool isChainDotTail(tt::DotOpInterface dotOp) {
     return true;
   return false;
 }
-
 } // namespace mlir::LLVM::AMD
