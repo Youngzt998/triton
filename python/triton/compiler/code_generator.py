@@ -456,14 +456,6 @@ class CodeGenerator(ast.NodeVisitor):
         self.lscope[name] = value
         self.local_defs[name] = value
 
-        # Record source var name in mlir::Location for low level debugging purpose
-        # "value" must be either mlir::BlockArgument, i.e. arguments of function,
-        #    or mlir::Value type, i.e. the named variables by a tensor or operation
-        if hasattr(value, "handle"):
-            loc = value.handle.get_loc()
-            loc.set_name(name)
-            value.handle.set_loc(loc)
-
     def _get_insertion_point_and_loc(self):
         # XXX: this is a hack to get the location of the insertion point.
         # The insertion point's location could be invalid sometimes,
@@ -681,8 +673,6 @@ class CodeGenerator(ast.NodeVisitor):
         if isinstance(target, ast.Attribute):
             raise NotImplementedError("Attribute assignment is not supported in triton")
         assert isinstance(target, ast.Name)
-        if knobs.compilation.dump_source_var_name:
-            print(f'Triton Source Value Name: {target.id}')
         self.set_value(self.visit(target), value)
 
     def visit_Assign(self, node):
@@ -699,7 +689,6 @@ class CodeGenerator(ast.NodeVisitor):
             return value
 
         targets = [node.target] if isinstance(node, ast.AnnAssign) else node.targets
-        values = _sanitize_value(self.visit(node.value))
         assert len(targets) == 1
         target = targets[0]
         if isinstance(target, ast.Name):
@@ -1500,14 +1489,6 @@ class CodeGenerator(ast.NodeVisitor):
                 else:
                     self.builder.set_loc(here_loc)
                 last_loc = self.builder.get_loc()
-
-            defined_name = self.defined_name
-
-            # if the value of this syntax will be assigned to a name
-            if self.defined_name is not None:
-                self.builder.set_loc_def_name(self.defined_name)
-                # child nodes didn't define this name, so don't carry a name to them
-                self.defined_name = None
             try:
                 ret = super().visit(node)
             except CompilationError:

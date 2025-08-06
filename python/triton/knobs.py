@@ -351,10 +351,7 @@ class cache_knobs(base_knobs):
 
 class compilation_knobs(base_knobs):
     override: env_bool = env_bool("TRITON_KERNEL_OVERRIDE")
-    # dumping out value defined at source Triton level
-    dump_source_var_name: env_bool = env_bool("TRITON_DUMP_SOURCE_VAR_NAME", False)
     dump_ir: env_bool = env_bool("TRITON_KERNEL_DUMP")
-    dump_ir_use_nameloc_as_prefix: env_bool = env_bool("USE_NAMELOC_AS_PREFIX")
     dump_ir_extract_di_local_variables: env_bool = env_bool("LLVM_EXTRACT_DI_LOCAL_VARIABLES")
     store_binary_only: env_bool = env_bool("TRITON_STORE_BINARY_ONLY")
     always_compile: env_bool = env_bool("TRITON_ALWAYS_COMPILE")

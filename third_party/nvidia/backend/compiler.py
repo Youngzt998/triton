@@ -332,7 +332,7 @@ class CUDABackend(BaseBackend):
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
-    def make_llvmir(self, src, metadata, options, capability):
+    def make_llir(self, src, metadata, options, capability):
         ptx_version = get_ptx_version_from_options(options, self.target.arch)
 
         mod = src
