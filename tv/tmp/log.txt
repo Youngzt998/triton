@@ -1,0 +1,22 @@
+Obtaining file:///home/zyang638/triton-dev/triton
+  Checking if build backend supports build_editable: started
+  Checking if build backend supports build_editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Building wheels for collected packages: triton
+  Building editable for triton (pyproject.toml): started
+  Building editable for triton (pyproject.toml): finished with status 'done'
+  Created wheel for triton: filename=triton-3.6.0+git894340b9-0.editable-cp312-cp312-linux_x86_64.whl size=4608 sha256=224d2a3045b5fe38e64e99b123e34716660fde0dbf2770cb4986286955fcceff
+  Stored in directory: /tmp/pip-ephem-wheel-cache-_dkuml66/wheels/62/11/91/ea4f56dd7bb8a6764ea0e85049b1593dc82016683a6a5be252
+Successfully built triton
+Installing collected packages: triton
+  Attempting uninstall: triton
+    Found existing installation: triton 3.6.0+git894340b9
+    Uninstalling triton-3.6.0+git894340b9:
+      Successfully uninstalled triton-3.6.0+git894340b9
+ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+torch 2.8.0+cu126 requires triton==3.4.0; platform_system == "Linux" and platform_machine == "x86_64", but you have triton 3.6.0+git894340b9 which is incompatible.
+Successfully installed triton-3.6.0+git894340b9
+
+[notice] A new release of pip is available: 25.0.1 -> 26.0.1
+[notice] To update, run: pip install --upgrade pip
