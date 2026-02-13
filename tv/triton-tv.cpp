@@ -169,10 +169,10 @@ int main(int argc, char **argv) {
   context.loadAllAvailableDialects();
 
 
-  floatingSATTest();
-  realSATTest();
+  // floatingSATTest();
+  // realSATTest();
 
-  return 0;
+  // return 0;
 
   // Parse first MLIR file
   mlir::OwningOpRef<mlir::ModuleOp> module1 = parseMLIRFile(inputFile1, context);
