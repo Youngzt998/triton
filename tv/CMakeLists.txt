@@ -51,3 +51,5 @@ else()
 endif()
 
 mlir_check_all_link_libraries(triton-tv)
+
+add_subdirectory(test/validator)

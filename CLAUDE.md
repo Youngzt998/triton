@@ -81,6 +81,8 @@ The compiler pipeline is extensible: backends register passes via `add_stages`. 
 
 **All translation validator development is confined to `tv/`.** Do not modify any files outside of `tv/` when working on the translation validator.
 
+**Any change to a major design component must be accompanied by corresponding updates to its test files.** If a class interface, data structure, or algorithm changes, the tests in `tv/test/validator/` must be updated to reflect the new design before the change is considered complete.
+
 ## `tv/` — Translation Validator
 
 `tv/` is an in-development translation validator that checks semantic equivalence between two MLIR files using Z3 SMT. It is a separate executable (`triton-tv`) built alongside the main Triton build.
@@ -100,11 +102,13 @@ python tv/test/make_unoptimized_ttir.py python/tutorials/01-vector-add.py
 ```
 
 **`tv/` structure:**
-- `semantics/Memory.h/.cpp` — Z3 array-theory memory model (byte-addressable, `BitVec(64) → BitVec(8)`); framework only, not yet fully implemented
+- `semantics/Memory.h/.cpp` — Z3 array-theory memory model (byte-addressable, `BitVec(64) → BitVec(8)`)
+- `semantics/Env.h/.cpp` — SSA value bindings: `map<mlir::Value, Z3Value>` + `makeSymbolicValue` + `initFuncArgs`
+- `semantics/State.h/.cpp` — complete symbolic program state: owns `Env` + `Memory` by value; `interpretOp` / `interpretBlock` / `checkEquivalence`
 - `semantics/mlir/` — (planned) per-op SMT encodings for TTIR ops
 - `test/TTIR/source/` — optimized `.ttir` inputs (captured from `triton.compile()`)
 - `test/TTIR/target/` — naming conventions doc for expected outputs
-- `test/validator/` — (planned) end-to-end validator tests
+- `test/validator/` — unit tests for Memory, Env, and State; planned end-to-end validator tests
 - `doc/ttir.md` — reference table of all TTIR ops and their SMT encoding strategy (simple bitvector vs. array theory vs. quantifiers)
 
 **SMT encoding strategy** (documented in [tv/doc/ttir.md](tv/doc/ttir.md)):
@@ -215,24 +219,48 @@ Memory store(const Memory   &mem,
 
 Both follow the TTIR masked semantics: `∀i. mask[i] ? mem[ptr[i]] : other[i]` for loads, `∀i. mask[i] → mem'[ptr[i]] = val[i]` for stores. The equivalence check at the top level compares the final `Memory` objects from both programs by asserting `mem1.array != mem2.array` and calling `solver.check()`.
 
-**Symbolic execution engine (`tv/semantics/mlir/`):**
+**Symbolic execution engine (`tv/semantics/State.h/.cpp` + `tv/semantics/mlir/`):**
 
-The core algorithm that translates MLIR ops into Z3 constraints. Walks the body of a `tt.func` and builds a Z3 expression for every SSA value.
+The core algorithm that translates MLIR ops into Z3 constraints. The top-level data structure is `State`, which owns both the SSA bindings and the heap. All methods are pure (return new State rather than mutating).
 
 *Data structures:*
+
+```cpp
+class State {
+public:
+    Env    env;        // map<mlir::Value, Z3Value> — SSA value -> Z3 encoding
+    // One independent Memory per !tt.ptr<T> kernel argument (Option B).
+    // Non-pointer args live in env only.
+    std::map<mlir::Value, Memory, ValuePtrLess> ptrMems;
+    // Future: Memory sharedMem; // for TTGIR ttg.local_alloc / ttg.local_store
+
+    // Factory: fresh symbolic state from a function's argument list.
+    static State initFromFunc(mlir::ValueRange args, z3::context &ctx,
+                              FPMode fpMode, const std::string &prefix);
+
+    State interpretOp(mlir::Operation *op) const;
+    State interpretBlock(mlir::Block &block) const;
+};
+
+z3::check_result checkEquivalence(const State &s1, const State &s2,
+                                   z3::solver &solver);
 ```
-Env : map<mlir::Value*, Z3Value>   // SSA value -> typed wrapper (Z3Scalar | Z3Tile | Z3Ptr)
-```
-The engine takes two modules and a shared `Memory`, symbolically executes both from the same initial state, then asserts that their output memory effects differ and asks Z3 to check satisfiability. UNSAT = equivalent.
+
+**Memory model choice — Option B (separate arrays per pointer argument):**
+Triton kernels are required to pass non-aliasing pointer arguments (the compiler freely reorders loads/stores across distinct arguments). Each pointer argument therefore owns a completely independent symbolic `Memory`. This eliminates aliasing as a concern for Z3 — there is no address arithmetic that can make one argument's accesses interfere with another's. The only exceptions (in-place operations where the same pointer arg is both read and written) are handled naturally: a single arg's `Memory` supports both reads and writes.
+
+`checkEquivalence` asserts that *at least one* per-argument memory differs (disjunction across all `ptrMems`), then asks `solver.check()`. UNSAT means all output memories are equal across both programs.
+
+The engine takes two `tt.func` bodies, builds a `State` for each starting from shared symbolic arguments, and then calls `checkEquivalence`. UNSAT = equivalent.
 
 *Algorithm:*
-1. For each `tt.func` argument, create a fresh unconstrained Z3 symbolic variable of the appropriate sort and bind it in `Env`.
-2. Walk the function body in SSA order (ops are already in def-before-use order in MLIR).
-3. For each op, call its translation function `translate(op, Env, Memory) → z3::expr` and bind the result value(s) in `Env`.
-4. After both functions are walked, collect all `tt.store` effects (as updates to the symbolic memory array).
-5. Assert `output_mem_1 ≠ output_mem_2` and call `solver.check()`. UNSAT = equivalent; SAT = counterexample.
+1. Call `State::initFromFunc` on each function's argument list with distinct prefixes (`"src"`, `"tgt"`). Pointer args get a fresh `Z3Ptr` (with `baseArg` set) and a fresh `Memory`; other args get symbolic scalars or tiles.
+2. Call `state.interpretBlock(func.body.front())`, which dispatches each op through `interpretOp`.
+3. For each op, the handler binds result values in `env` and/or updates the appropriate `ptrMems[baseArg]`. Returns updated `State`.
+4. After both functions are walked, call `checkEquivalence(s1, s2, solver)`.
+5. `checkEquivalence` adds `s1.globalMem.array != s2.globalMem.array` and calls `solver.check()`. UNSAT = equivalent; SAT = counterexample.
 
-*Translation functions* (to implement in `semantics/mlir/`, one file per op group):
+*Per-op handlers* (to implement in `semantics/mlir/`, one file per op group):
 - Arithmetic ops (`arith.*`, `math.*`) → direct Z3 arithmetic or bitvector ops
 - `tt.splat`, `tt.make_range`, `tt.broadcast`, `tt.reshape` → Z3 array constructors / lambda expressions
 - `tt.addptr` → bitvector addition on the address array
@@ -241,7 +269,24 @@ The engine takes two modules and a shared `Memory`, symbolically executes both f
 - `tt.dot` → axiomatized or encoded as a summation over the tile index (expensive; defer to later milestone)
 - `tt.reduce` / `tt.scan` → quantifier-based encoding or axiomatized with associativity/commutativity
 
-*Control flow:* SSA-form MLIR with `scf.if` / `scf.for` needs phi-node-style merging. For `scf.if`: encode both branches and use `z3::ite` on the condition. For `scf.for`: unroll if bounds are statically known; otherwise axiomatize the loop invariant (deferred).
+*Control flow* (`interpretOp` dispatches these from `State.cpp`):
+
+`scf.if` — both branches executed symbolically from the same pre-branch state; results merged with `z3::ite`:
+```
+cond = env.lookup(ifOp.condition)
+thenState = interpretBlock(thenRegion.front())
+elseState = interpretBlock(elseRegion.front())
+for each yield r_i:
+    merged.env[r_i] = ite(cond, thenState.env[r_i], elseState.env[r_i])
+merged.globalMem.array = ite(cond, thenState.globalMem.array, elseState.globalMem.array)
+```
+
+`scf.for` — three strategies (implemented in order of preference):
+- **Strategy A (static unrolling)**: trip count is a compile-time constant; thread state through N body copies. Correct for any N but formula size is O(N × body_size). Practical for small trip counts (N ≤ ~16).
+- **Strategy B (loop invariant)**: require a user-supplied invariant predicate I(state); assert I(init), I(s) → I(body(s)), use I(final). Deferred.
+- **Strategy C (abstraction)**: treat loop as opaque transformer, assert only needed output properties. Deferred.
+
+`scf.while` — deferred; calls `llvm_unreachable`.
 
 **Evaluation plan:**
 
