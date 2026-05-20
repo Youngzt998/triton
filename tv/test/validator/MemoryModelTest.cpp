@@ -72,6 +72,11 @@ TEST(MemoryModel, ElemSortFloat) {
   auto f32Ty = mlir::Float32Type::get(&mlirCtx);
   auto f64Ty = mlir::Float64Type::get(&mlirCtx);
 
+  // Abstract: opaque BV id, width matches IEEE type width
+  EXPECT_EQ(getElemSort(ctx, f32Ty, FPMode::Abstract).sort_kind(), Z3_BV_SORT);
+  EXPECT_EQ(getElemSort(ctx, f32Ty, FPMode::Abstract).bv_size(),   32u);
+  EXPECT_EQ(getElemSort(ctx, f64Ty, FPMode::Abstract).bv_size(),   64u);
+
   // IntegerRange: FP treated as bitvector of same width
   EXPECT_EQ(getElemSort(ctx, f32Ty, FPMode::IntegerRange).bv_size(), 32u);
   EXPECT_EQ(getElemSort(ctx, f64Ty, FPMode::IntegerRange).bv_size(), 64u);
@@ -285,6 +290,44 @@ TEST(MemoryModel, NonEquivalentProgramsSAT) {
   z3::expr addr = ctx.bv_val((uint64_t)0x5000, 64);
   solver.add(z3::select(m1.array, addr) != z3::select(m2.array, addr));
   EXPECT_EQ(solver.check(), z3::sat);
+}
+
+//===----------------------------------------------------------------------===//
+// Abstract FP: byte-heap roundtrip
+//
+// Under FPMode::Abstract, FP values are BitVec(width) ids. They should
+// store and load through the byte heap just like integers do.
+//===----------------------------------------------------------------------===//
+
+TEST(MemoryModel, AbstractFpStoreLoadRoundtrip) {
+  z3::context ctx;
+  mlir::MLIRContext mlirCtx;
+  auto f32Ty = mlir::Float32Type::get(&mlirCtx);
+  auto i1Ty  = mlir::IntegerType::get(&mlirCtx, 1);
+
+  // Store an arbitrary symbolic FP id, then load it back; it must match.
+  Memory init(ctx, FPMode::Abstract, "mem_fp_abs");
+  Memory m = init;
+
+  uint64_t baseAddr = 0x9000;
+  auto ptrTile  = makePtrTile(ctx, f32Ty, baseAddr, 4, {1});
+  auto trueMask = makeMaskTile(ctx, i1Ty, true, {1});
+
+  // Build a value tile whose single element is a fresh symbolic BV(32).
+  z3::expr sym  = ctx.bv_const("fp_sym", 32);
+  z3::expr i    = ctx.bv_const("i_v", 32);
+  Z3Tile valTile{z3::lambda(i, sym), {1}, f32Ty, FPMode::Abstract, {}};
+
+  m.store(ptrTile, valTile, trueMask);
+
+  // Load and compare against the original symbolic value.
+  z3::expr idx0    = ctx.bv_val(0u, 32);
+  z3::expr loaded0 = z3::select(
+      m.load(ptrTile, trueMask, valTile).expr, idx0);
+
+  z3::solver solver(ctx);
+  solver.add(loaded0 != sym);
+  EXPECT_EQ(solver.check(), z3::unsat);
 }
 
 int main(int argc, char **argv) {

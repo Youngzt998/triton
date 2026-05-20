@@ -11,11 +11,22 @@
 
 namespace Semantics {
 
+// Floating-point encoding strategy.
+//
+// Only `Abstract` is currently supported by the validator. Under Abstract,
+// every FP value is a fresh BitVec(typeWidth) "id" and every FP operation
+// is an uninterpreted function declared in tv/semantics/AbstractFp.h; the
+// solver knows only what AbstractFp asserts as axioms. Because the carrier
+// is a plain bitvector, FP values store and load through the byte-addressable
+// heap with no special handling.
+//
+// The other three modes are placeholders for future work — see
+// CLAUDE.md ("Memory model design") for their planned semantics.
 enum class FPMode {
-  Abstract,     // uninterpreted sort; ops are uninterpreted functions with axioms
-  Real,         // Z3 Real; ops map to real arithmetic
-  IntegerRange, // BitVec(N) significand; assumes large values (no rounding)
-  FPA           // z3::fpa_sort (IEEE 754); fully precise ground-truth baseline
+  Abstract,     // BitVec(width) id; ops are uninterpreted functions + axioms
+  Real,         // (planned) Z3 Real; ops map to real arithmetic
+  IntegerRange, // (planned) BitVec(N) significand under no-rounding assumption
+  FPA           // (planned) z3::fpa_sort (IEEE 754); fully precise baseline
 };
 
 // A scalar MLIR value encoded as a Z3 expression.
@@ -62,8 +73,12 @@ unsigned getByteWidth(mlir::Type type);
 //
 // load() returns a new Z3Tile; store() mutates array in place and returns *this.
 //
-// NOTE: Abstract and Real FP modes are not yet supported for load/store —
-// they require a higher-level memory abstraction that bypasses byte layout.
+// FP element handling: under FPMode::Abstract, FP values are BitVec(width) ids
+// (see AbstractFp.h) and are read/written as raw bytes like integers. The
+// abstract semantics is recovered when an operation handler in semantics/mlir/
+// applies AbstractFp's uninterpreted functions to a loaded value.
+//
+// The Real / IntegerRange / FPA modes are not yet wired in to load/store.
 class Memory {
 public:
   z3::context &ctx;

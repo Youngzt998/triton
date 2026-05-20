@@ -103,6 +103,7 @@ python tv/test/make_unoptimized_ttir.py python/tutorials/01-vector-add.py
 
 **`tv/` structure:**
 - `semantics/Memory.h/.cpp` — Z3 array-theory memory model (byte-addressable, `BitVec(64) → BitVec(8)`)
+- `semantics/AbstractFp.h/.cpp` — abstract FP encoding (BV ids + uninterpreted ops + axioms); see "Memory model design" below
 - `semantics/Env.h/.cpp` — SSA value bindings: `map<mlir::Value, Z3Value>` + `makeSymbolicValue` + `initFuncArgs`
 - `semantics/State.h/.cpp` — complete symbolic program state: owns `Env` + `Memory` by value; `interpretOp` / `interpretBlock` / `checkEquivalence`
 - `semantics/mlir/` — (planned) per-op SMT encodings for TTIR ops
@@ -119,25 +120,25 @@ python tv/test/make_unoptimized_ttir.py python/tutorials/01-vector-add.py
 
 **Memory model design (`tv/semantics/Memory.h/.cpp`):**
 
-The memory model needs to support multiple strategies for encoding floating-point data types and tiles. Four planned modes:
+The memory model is designed to support multiple FP encoding strategies, but **the validator currently focuses on the Abstract mode**. The other three are planned future work; they remain as `FPMode` enum values so the rest of the code can branch on them once they come online.
 
-1. **Abstract tile model** — each tile of data is an opaque abstract ID (an uninterpreted Z3 sort). FP operations are declared as uninterpreted functions over these IDs, with only their essential algebraic properties asserted as axioms (e.g. commutativity of addition). Fastest for proving structural properties; cannot reason about numeric values.
+1. **Abstract id model** — *primary, implemented.* Each FP value is a fresh `BitVec(typeWidth)` "id" with no IEEE meaning attached to its bits; the value flows through the byte-addressable heap like any other bitvector. All FP operations are declared as uninterpreted Z3 functions (`fp_add_<ty>`, `fp_mul_<ty>`, etc.), one decl per `(operation, FloatType)`. Properties that proofs need — commutativity of `+` and `*`, `neg(neg x) = x`, pairwise distinctness of the reserved constants — are asserted as axioms; everything else is left fully unknown so the solver cannot rely on accidental numerical equalities. This is the same approach used by mlir-tv. See [tv/semantics/AbstractFp.h](tv/semantics/AbstractFp.h) for the full encoding (per-type `AbstractFp` objects, reserved `+0 / -0 / +inf / -inf / nan` constants, `addAxioms` for emission, and `AbstractFpRegistry` keyed by `FloatType`).
 
-2. **Real number model** — each FP value is encoded as a Z3 real. FP operations map to their exact real-arithmetic counterparts. Sound approximation that ignores rounding; useful for verifying transformations that are exact over reals (e.g. reassociation proofs where rounding is irrelevant).
+2. **Real number model** (planned) — each FP value as a Z3 real, FP ops as exact real arithmetic. Sound approximation that ignores rounding; useful for reassociation proofs.
 
-3. **Integer range model** — each FP value is encoded as an integer representing its significand, under the assumption that all values are large enough that rounding behavior is determined entirely by the integer range (i.e. no subnormals, no cancellation). FP arithmetic becomes integer arithmetic with controlled range constraints. Useful for proving equivalence under the "no precision loss" regime.
+3. **Integer range model** (planned) — each FP value as a bitvector significand under the assumption that no subnormals/cancellation occur. Useful for proving equivalence under the "no precision loss" regime.
 
-4. **Native Z3 FPA model** — each FP value is encoded using Z3's built-in IEEE 754 floating-point theory (`z3::fpa_sort`). Fully precise: models NaN, infinity, subnormals, signed zero, and all rounding modes. Slowest — solved via bit-blasting to SAT. Used as a ground-truth baseline to validate that the three approximation modes are sound (i.e., when mode 1/2/3 says UNSAT, does FPA agree?).
+4. **Native Z3 FPA model** (planned) — each FP value via Z3's IEEE 754 theory (`z3::fpa_sort`). Fully precise (models NaN, infinity, subnormals, signed zero, rounding modes); solved by bit-blasting to SAT, so slow. Will serve as a ground-truth baseline for soundness of the three approximation modes.
 
 *Top-level structure:*
 
-The memory model is a mapping from **names** (MLIR SSA value names or symbolic buffer names) to **Z3-encoded data types**. It owns the Z3 context and is the single source of truth for all symbolic values during validation.
+A `Memory` object represents one symbolic heap — a byte-addressable Z3 array — together with the Z3 context and FP mode needed to perform load/store operations on it. SSA-value bindings are *not* stored here; those live in `Env`. A program state typically owns one `Memory` per pointer argument (see "Symbolic execution engine" below).
 
 ```
 Memory {
-    ctx          : z3::context
-    fp_mode      : FPMode  // Abstract | Real | IntegerRange | FPA
-    bindings     : map<string, Z3Value>   // name -> encoded value
+    ctx     : z3::context  // shared Z3 context (held by reference)
+    fpMode  : FPMode       // Abstract | Real | IntegerRange | FPA
+    array   : z3::expr     // Array(BitVec(64), BitVec(8))
 }
 ```
 
@@ -151,10 +152,10 @@ Memory {
 | `!tt.ptr<T>` | `BitVec(64)` (byte address) |
 
 *Floating-point encoding per mode:*
-- **Abstract**: uninterpreted sort `FP_abstract`; ops are uninterpreted functions with axioms
-- **Real**: `Real`; ops map to Z3 real arithmetic
-- **IntegerRange**: `BitVec(N)` (significand bits only); ops are integer arithmetic with range assertions
-- **FPA**: `z3::fpa_sort(exp_bits, sig_bits)`; ops use Z3's native `Z3_mk_fpa_*` API with explicit rounding mode
+- **Abstract** *(primary)*: `BitVec(typeWidth)` carrier — the bits are opaque "ids", not IEEE bit patterns. Arithmetic is delegated to uninterpreted functions in `AbstractFp` (`fp_add_<ty>`, `fp_mul_<ty>`, …). Reserved constants (`+0`, `-0`, `+inf`, `-inf`, `nan`) are also fresh BV constants, kept pairwise distinct by axiom. Because the carrier is a plain bitvector, FP load/store rides the byte heap with no special-casing.
+- **Real** *(planned)*: `Real`; ops map to Z3 real arithmetic
+- **IntegerRange** *(planned)*: `BitVec(N)` (significand bits only); ops are integer arithmetic with range assertions
+- **FPA** *(planned)*: `z3::fpa_sort(exp_bits, sig_bits)`; ops use Z3's native `Z3_mk_fpa_*` API with explicit rounding mode
 
 *Array / tile types:*
 

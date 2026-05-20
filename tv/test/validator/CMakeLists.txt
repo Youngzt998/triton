@@ -79,3 +79,27 @@ endif()
 target_include_directories(TestTritonTVState PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../..
 )
+
+# ---------------------------------------------------------------------------
+# AbstractFp tests — pure semantics module, only depends on MLIR builtin types.
+# ---------------------------------------------------------------------------
+
+add_triton_ut(
+  NAME TestTritonTVAbstractFp
+  SRCS AbstractFpTest.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/../../semantics/AbstractFp.cpp
+  LIBS
+    MLIRIR
+    MLIRSupport
+)
+
+if(TARGET z3::libz3)
+  target_link_libraries(TestTritonTVAbstractFp PRIVATE z3::libz3)
+else()
+  target_include_directories(TestTritonTVAbstractFp PRIVATE ${Z3_INCLUDE_DIRS})
+  target_link_libraries(TestTritonTVAbstractFp PRIVATE ${Z3_LIBRARIES})
+endif()
+
+target_include_directories(TestTritonTVAbstractFp PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../..
+)

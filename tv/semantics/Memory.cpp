@@ -20,15 +20,17 @@ static std::pair<unsigned, unsigned> getFPExpSigBits(mlir::FloatType ft) {
 }
 
 // Convert a Z3 value to a bitvector for writing into the byte-addressable heap.
-//   FPA        -> ieee bitvector reinterpretation
-//   IntegerRange / integer -> pass through (already BitVec)
-//   Bool (i1)  -> BitVec(1)
+//   Abstract / IntegerRange FP -> pass through (already BitVec)
+//   FPA FP                     -> ieee bitvector reinterpretation
+//   integer (i>=8)             -> pass through
+//   i1                         -> BitVec(1)
+//   pointer                    -> pass through (already BitVec(64))
 static z3::expr toBV(z3::context &ctx, z3::expr val,
                      mlir::Type type, FPMode mode) {
   if (llvm::isa<mlir::FloatType>(type)) {
     if (mode == FPMode::FPA)
       return z3::expr(ctx, Z3_mk_fpa_to_ieee_bv(ctx, val));
-    return val; // IntegerRange: already a bitvector
+    return val; // Abstract / IntegerRange: already BitVec(width)
   }
   if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(type)) {
     if (intTy.getWidth() == 1)
@@ -52,7 +54,10 @@ z3::sort Semantics::getElemSort(z3::context &ctx, mlir::Type type,
   if (auto floatTy = llvm::dyn_cast<mlir::FloatType>(type)) {
     switch (fpMode) {
     case FPMode::Abstract:
-      return ctx.uninterpreted_sort("FP_abstract");
+      // FP values are opaque BV ids; arithmetic is performed by uninterpreted
+      // functions declared in AbstractFp.h. The carrier matches the IEEE
+      // bit-width so values pass through the byte heap unchanged.
+      return ctx.bv_sort(floatTy.getWidth());
     case FPMode::Real:
       return ctx.real_sort();
     case FPMode::IntegerRange:
@@ -100,11 +105,10 @@ z3::expr Memory::readBytes(z3::expr addr, unsigned byteWidth) const {
 Z3Tile Memory::load(const Z3Tile &ptrTile,
                     const Z3Tile &maskTile,
                     const Z3Tile &otherTile) const {
-  // Abstract/Real modes require a higher-level memory abstraction.
-  // TODO: implement symbolic load for Abstract/Real once the execution engine
-  //       design clarifies how these modes interact with memory.
-  if (fpMode == FPMode::Abstract || fpMode == FPMode::Real)
-    llvm_unreachable("load: Abstract/Real FP modes not yet supported");
+  // Real mode cannot ride the byte-addressable heap (no fixed bit pattern).
+  // Abstract mode uses a BV(width) carrier, so it falls through like an int.
+  if (fpMode == FPMode::Real)
+    llvm_unreachable("load: Real FP mode not yet supported");
 
   unsigned byteWidth = getByteWidth(otherTile.elemType);
 
@@ -124,7 +128,8 @@ Z3Tile Memory::load(const Z3Tile &ptrTile,
         z3::sort fps = ctx.fpa_sort(expBits, sigBits);
         return z3::expr(ctx, Z3_mk_fpa_to_fp_bv(ctx, rawBV, fps));
       }
-      // IntegerRange: bitvector significand, no conversion needed.
+      // Abstract: opaque BV id, no conversion.
+      // IntegerRange: bitvector significand, no conversion.
       return rawBV;
     }
     if (auto intTy = llvm::dyn_cast<mlir::IntegerType>(otherTile.elemType)) {
@@ -141,9 +146,9 @@ Z3Tile Memory::load(const Z3Tile &ptrTile,
 Memory &Memory::store(const Z3Tile &ptrTile,
                       const Z3Tile &valTile,
                       const Z3Tile &maskTile) {
-  // Abstract/Real modes not yet supported (see load comment above).
-  if (fpMode == FPMode::Abstract || fpMode == FPMode::Real)
-    llvm_unreachable("store: Abstract/Real FP modes not yet supported");
+  // Real mode is not byte-storable; Abstract uses BV(width) so it just works.
+  if (fpMode == FPMode::Real)
+    llvm_unreachable("store: Real FP mode not yet supported");
 
   unsigned byteWidth = getByteWidth(valTile.elemType);
 
