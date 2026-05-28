@@ -60,9 +60,12 @@ target_include_directories(TestTritonTVEnv PRIVATE
 add_triton_ut(
   NAME TestTritonTVState
   SRCS StateTest.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/../../semantics/AbstractFp.cpp
        ${CMAKE_CURRENT_SOURCE_DIR}/../../semantics/Memory.cpp
        ${CMAKE_CURRENT_SOURCE_DIR}/../../semantics/Env.cpp
        ${CMAKE_CURRENT_SOURCE_DIR}/../../semantics/State.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/../../semantics/mlir/ArithOps.cpp
+       ${CMAKE_CURRENT_SOURCE_DIR}/../../semantics/mlir/TritonOps.cpp
   LIBS
     ${triton_libs}
     MLIRIR

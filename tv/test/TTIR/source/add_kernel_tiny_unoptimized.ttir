@@ -1,0 +1,45 @@
+// Tiny unoptimized add kernel — same observable behavior as add_kernel_tiny.ttir
+// but with redundant arithmetic that an optimizer should be free to remove:
+//   1. block_start = pid * 4   is computed as   pid * 2 + pid * 2
+//   2. offsets are passed through a redundant +0 (splat of zero)
+//   3. block_start undergoes an extsi/extsi round-trip not on the data path
+//
+// Validator must report EQUIVALENT vs add_kernel_tiny.ttir.
+module {
+  tt.func public @add_kernel_tiny(%x_ptr: !tt.ptr<f32>, %y_ptr: !tt.ptr<f32>, %output_ptr: !tt.ptr<f32>, %n_elements: i32) attributes {noinline = false} {
+    %c0_i32 = arith.constant 0 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %pid = tt.get_program_id x : i32
+
+    // block_start = pid * 2 + pid * 2  (semantically pid * 4)
+    %half_a = arith.muli %pid, %c2_i32 : i32
+    %half_b = arith.muli %pid, %c2_i32 : i32
+    %block_start = arith.addi %half_a, %half_b : i32
+
+    %offsets = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+    %offsets_0 = tt.splat %block_start : i32 -> tensor<4xi32>
+    %offsets_1 = arith.addi %offsets_0, %offsets : tensor<4xi32>
+
+    // Redundant pass-through: + splat(0)
+    %zero_tile = tt.splat %c0_i32 : i32 -> tensor<4xi32>
+    %offsets_redundant = arith.addi %offsets_1, %zero_tile : tensor<4xi32>
+
+    %mask = tt.splat %n_elements : i32 -> tensor<4xi32>
+    %mask_2 = arith.cmpi slt, %offsets_redundant, %mask : tensor<4xi32>
+
+    %x = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %x_3 = tt.addptr %x, %offsets_redundant : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %x_4 = tt.load %x_3, %mask_2 : tensor<4x!tt.ptr<f32>>
+
+    %y = tt.splat %y_ptr : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %y_5 = tt.addptr %y, %offsets_redundant : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %y_6 = tt.load %y_5, %mask_2 : tensor<4x!tt.ptr<f32>>
+
+    %output = arith.addf %x_4, %y_6 : tensor<4xf32>
+
+    %0 = tt.splat %output_ptr : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %1 = tt.addptr %0, %offsets_redundant : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    tt.store %1, %output, %mask_2 : tensor<4x!tt.ptr<f32>>
+    tt.return
+  }
+}

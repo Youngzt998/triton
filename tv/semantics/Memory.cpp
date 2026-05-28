@@ -157,22 +157,19 @@ Memory &Memory::store(const Z3Tile &ptrTile,
   for (int64_t dim : valTile.shape)
     n *= static_cast<unsigned>(dim);
 
-  // Build the updated heap as a Z3 lambda:
-  //   λaddr:BitVec(64).
-  //     ite(mask[0] ∧ addr ∈ bytes(ptr[0]), byte(val[0], offset),
-  //     ite(mask[1] ∧ addr ∈ bytes(ptr[1]), byte(val[1], offset),
-  //     ...
-  //     old_array[addr]))
+  // Apply each masked write via Z3's built-in array store (z3::store), which
+  // stays in the quantifier-free theory of arrays (QF_AX). Using z3::lambda
+  // here would introduce quantifiers and make the solver return `unknown` when
+  // asked to prove two stores are unequal (array extensionality over lambdas
+  // is undecidable for the default DPLL(T) solver).
   //
-  // NOTE: for large tiles (e.g. 1024 elements × 4 bytes = 4096 ite branches)
-  // this creates a large Z3 expression. For the first version this is correct
-  // and acceptable for small queries. A quantifier-based encoding should be
+  // When mask[i] is false we write back the current byte (a no-op), so the
+  // conditional reduces to: store(arr, addr, ite(mask, new_byte, arr[addr])).
+  //
+  // NOTE: for large tiles (e.g. 1024 elements × 4 bytes = 4096 store nodes)
+  // this creates a large Z3 expression. A quantifier-based encoding should be
   // used once tile sizes become a bottleneck.
-  z3::expr addr   = ctx.bv_const("__store_addr", 64);
-  z3::expr result = z3::select(array, addr); // default: existing byte
-
-  // Build ite chain from last index to first so that index 0 wins on overlap.
-  for (int idx = static_cast<int>(n) - 1; idx >= 0; idx--) {
+  for (unsigned idx = 0; idx < n; idx++) {
     z3::expr idxExpr = ctx.bv_val(idx, 32);
     z3::expr ptr_i   = z3::select(ptrTile.expr,  idxExpr);
     z3::expr mask_i  = z3::select(maskTile.expr, idxExpr);
@@ -182,10 +179,10 @@ Memory &Memory::store(const Z3Tile &ptrTile,
     for (unsigned j = 0; j < byteWidth; j++) {
       z3::expr byteAddr = ptr_i + ctx.bv_val(j, 64);
       z3::expr byte_j   = bv_i.extract(j * 8 + 7, j * 8);
-      result = z3::ite(mask_i && (addr == byteAddr), byte_j, result);
+      array = z3::store(array, byteAddr,
+                        z3::ite(mask_i, byte_j, z3::select(array, byteAddr)));
     }
   }
 
-  array = z3::lambda(addr, result);
   return *this;
 }

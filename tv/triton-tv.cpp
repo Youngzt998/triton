@@ -1,5 +1,8 @@
 #include "../bin/RegisterTritonDialects.h"
 
+#include "semantics/State.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
+
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -157,48 +160,135 @@ void realSATTest(){
   }
 }
 
+// Extract the first tt.func from a module. Returns null if none found.
+static mlir::triton::FuncOp extractFunc(mlir::ModuleOp mod) {
+  mlir::triton::FuncOp result;
+  mod->walk([&](mlir::triton::FuncOp f) {
+    result = f;
+    return mlir::WalkResult::interrupt();
+  });
+  return result;
+}
+
 int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv, "MLIR Translation Validator\n");
 
-  // Set up dialect registry with all Triton dialects
   mlir::DialectRegistry registry;
   registerTritonDialects(registry);
-
-  // Create context and load all registered dialects
   mlir::MLIRContext context(registry);
   context.loadAllAvailableDialects();
 
-
-  // floatingSATTest();
-  // realSATTest();
-
-  // return 0;
-
-  // Parse first MLIR file
   mlir::OwningOpRef<mlir::ModuleOp> module1 = parseMLIRFile(inputFile1, context);
   if (!module1) {
-    llvm::errs() << "Failed to parse first file: " << inputFile1 << "\n";
+    llvm::errs() << "Failed to parse: " << inputFile1 << "\n";
     return 1;
   }
-
-  // Parse second MLIR file  
   mlir::OwningOpRef<mlir::ModuleOp> module2 = parseMLIRFile(inputFile2, context);
   if (!module2) {
-    llvm::errs() << "Failed to parse second file: " << inputFile2 << "\n";
+    llvm::errs() << "Failed to parse: " << inputFile2 << "\n";
     return 1;
   }
 
-  // Both modules are now accessible
-  llvm::outs() << "Successfully parsed both MLIR files.\n";
-  llvm::outs() << "Module 1 has " << module1->getBody()->getOperations().size()
-               << " top-level operations.\n";
-  llvm::outs() << "Module 2 has " << module2->getBody()->getOperations().size()
-               << " top-level operations.\n";
+  mlir::triton::FuncOp func1 = extractFunc(*module1);
+  mlir::triton::FuncOp func2 = extractFunc(*module2);
+  if (!func1 || !func2) {
+    llvm::errs() << "Could not find tt.func in one of the modules.\n";
+    return 1;
+  }
 
-  // TODO: Add your custom logic here to work with module1 and module2
-  // Examples:
-  //   - module1->walk([](Operation *op) { ... });
-  //   - for (auto &op : module1->getBody()->getOperations()) { ... }
+  llvm::outs() << "Validating: " << func1.getName() << " vs "
+               << func2.getName() << "\n";
 
-  return 0;
+  //--------------------------------------------------------------------------
+  // Build symbolic initial states.
+  //--------------------------------------------------------------------------
+  z3::context ctx;
+  z3::solver  solver(ctx);
+
+  auto srcArgs = func1.getBody().getArguments();
+  auto tgtArgs = func2.getBody().getArguments();
+
+  if (srcArgs.size() != tgtArgs.size()) {
+    llvm::errs() << "Argument count mismatch.\n";
+    return 1;
+  }
+
+  Semantics::State s1 = Semantics::State::initFromFunc(
+      srcArgs, ctx, Semantics::FPMode::Abstract, "src");
+  Semantics::State s2 = Semantics::State::initFromFunc(
+      tgtArgs, ctx, Semantics::FPMode::Abstract, "tgt");
+
+  //--------------------------------------------------------------------------
+  // Assert shared inputs: corresponding arguments have the same values.
+  //--------------------------------------------------------------------------
+  for (unsigned i = 0; i < srcArgs.size(); ++i) {
+    mlir::Value sa = srcArgs[i];
+    mlir::Value ta = tgtArgs[i];
+
+    bool srcHasMem = s1.ptrMems.count(sa) > 0;
+    bool tgtHasMem = s2.ptrMems.count(ta) > 0;
+
+    if (srcHasMem && tgtHasMem) {
+      // Pointer arg: initial heap contents are equal AND the pointer addresses
+      // themselves must match (they're the same kernel-level argument).
+      solver.add(s1.ptrMems.at(sa).array == s2.ptrMems.at(ta).array);
+      auto &sp = std::get<Semantics::Z3Ptr>(s1.env.lookup(sa));
+      auto &tp = std::get<Semantics::Z3Ptr>(s2.env.lookup(ta));
+      solver.add(sp.expr == tp.expr);
+    } else {
+      // Scalar/tensor arg: symbolic values are equal.
+      std::visit([&](auto &v1) {
+        using T = std::decay_t<decltype(v1)>;
+        solver.add(v1.expr == std::get<T>(s2.env.lookup(ta)).expr);
+      }, s1.env.lookup(sa));
+    }
+  }
+
+  //--------------------------------------------------------------------------
+  // Symbolically interpret both programs.
+  //--------------------------------------------------------------------------
+  auto t0 = std::chrono::high_resolution_clock::now();
+
+  Semantics::State s1f = s1.interpretBlock(func1.getBody().front());
+  Semantics::State s2f = s2.interpretBlock(func2.getBody().front());
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  llvm::outs() << "Interpretation: "
+               << std::chrono::duration<double>(t1 - t0).count() << " s\n";
+
+  //--------------------------------------------------------------------------
+  // Emit AbstractFp axioms and check equivalence.
+  //--------------------------------------------------------------------------
+  s1f.fpReg->addAxioms(solver);
+  s2f.fpReg->addAxioms(solver);
+
+  // Assert that at least one output memory differs between the two programs.
+  z3::expr anyDiffers = ctx.bool_val(false);
+  for (unsigned i = 0; i < srcArgs.size(); ++i) {
+    mlir::Value sa = srcArgs[i];
+    mlir::Value ta = tgtArgs[i];
+    if (s1f.ptrMems.count(sa) && s2f.ptrMems.count(ta)) {
+      anyDiffers = anyDiffers ||
+                   (s1f.ptrMems.at(sa).array != s2f.ptrMems.at(ta).array);
+    }
+  }
+  solver.add(anyDiffers);
+
+  auto t2 = std::chrono::high_resolution_clock::now();
+  auto result = solver.check();
+  auto t3 = std::chrono::high_resolution_clock::now();
+  llvm::outs() << "Solver: "
+               << std::chrono::duration<double>(t3 - t2).count() << " s\n";
+
+  if (result == z3::unsat) {
+    llvm::outs() << "EQUIVALENT\n";
+    return 0;
+  } else if (result == z3::sat) {
+    llvm::outs() << "NOT EQUIVALENT — counterexample found\n";
+    llvm::outs() << solver.get_model().to_string().c_str() << "\n";
+    return 1;
+  } else {
+    llvm::outs() << "UNKNOWN (solver timed out or gave up)\n";
+    return 2;
+  }
 }

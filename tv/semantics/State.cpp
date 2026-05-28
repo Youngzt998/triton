@@ -1,11 +1,16 @@
 #include "State.h"
 
+#include "semantics/AbstractFp.h"
+#include "semantics/mlir/ArithOps.h"
+#include "semantics/mlir/TritonOps.h"
+
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "mlir/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/ErrorHandling.h"
 
+#include <memory>
 #include <optional>
 
 using namespace Semantics;
@@ -14,8 +19,11 @@ using namespace Semantics;
 // State
 //===----------------------------------------------------------------------===//
 
-State::State(Env env, std::map<mlir::Value, Memory, ValuePtrLess> ptrMems)
-    : env(std::move(env)), ptrMems(std::move(ptrMems)) {}
+State::State(Env env, std::map<mlir::Value, Memory, ValuePtrLess> ptrMems,
+             z3::context &ctx, FPMode fpMode,
+             std::shared_ptr<AbstractFpRegistry> fpReg)
+    : env(std::move(env)), ptrMems(std::move(ptrMems)),
+      ctx(ctx), fpMode(fpMode), fpReg(std::move(fpReg)) {}
 
 //===----------------------------------------------------------------------===//
 // initFromFunc
@@ -25,6 +33,7 @@ State State::initFromFunc(mlir::ValueRange args, z3::context &ctx,
                           FPMode fpMode, const std::string &prefix) {
   Env env;
   std::map<mlir::Value, Memory, ValuePtrLess> ptrMems;
+  auto fpReg = std::make_shared<AbstractFpRegistry>(ctx);
 
   for (auto [idx, arg] : llvm::enumerate(args)) {
     std::string symName = prefix + "_arg" + std::to_string(idx);
@@ -43,7 +52,7 @@ State State::initFromFunc(mlir::ValueRange args, z3::context &ctx,
     }
   }
 
-  return State(std::move(env), std::move(ptrMems));
+  return State(std::move(env), std::move(ptrMems), ctx, fpMode, std::move(fpReg));
 }
 
 //===----------------------------------------------------------------------===//
@@ -68,8 +77,6 @@ State State::interpretBlock(mlir::Block &block) const {
 //===----------------------------------------------------------------------===//
 
 State State::interpretOp(mlir::Operation *op) const {
-  llvm::StringRef dialect =
-      op->getDialect() ? op->getDialect()->getNamespace() : "";
   llvm::StringRef opName = op->getName().getStringRef();
 
   // --- Structured control flow ---
@@ -77,17 +84,30 @@ State State::interpretOp(mlir::Operation *op) const {
   if (opName == "scf.for")   return interpretFor(op);
   if (opName == "scf.while") return interpretWhile(op);
 
-  // --- Triton core ops (tt.*) ---
-  // TODO: implement per-op handlers in semantics/mlir/
+  // --- Triton core ops ---
+  if (opName == "tt.get_program_id") return handleTtGetProgramId(*this, op);
+  if (opName == "tt.make_range")     return handleTtMakeRange(*this, op);
+  if (opName == "tt.splat")          return handleTtSplat(*this, op);
+  if (opName == "tt.addptr")         return handleTtAddPtr(*this, op);
+  if (opName == "tt.load")           return handleTtLoad(*this, op);
+  if (opName == "tt.store")          return handleTtStore(*this, op);
 
-  // --- Arithmetic / math ops ---
-  // TODO: implement per-op handlers in semantics/mlir/
+  // --- Arithmetic ops ---
+  if (opName == "arith.constant") return handleArithConstant(*this, op);
+  if (opName == "arith.addi")     return handleArithAddi(*this, op);
+  if (opName == "arith.subi")     return handleArithSubi(*this, op);
+  if (opName == "arith.muli")     return handleArithMuli(*this, op);
+  if (opName == "arith.andi")     return handleArithAndi(*this, op);
+  if (opName == "arith.extsi")    return handleArithExtsi(*this, op);
+  if (opName == "arith.cmpi")     return handleArithCmpi(*this, op);
+  if (opName == "arith.addf")     return handleArithAddf(*this, op);
+  if (opName == "arith.subf")     return handleArithSubf(*this, op);
+  if (opName == "arith.mulf")     return handleArithMulf(*this, op);
 
   // --- Function terminators — no effect on state ---
   if (opName == "tt.return" || opName == "func.return")
     return *this;
 
-  (void)dialect;
   llvm_unreachable(
       ("interpretOp: unimplemented op '" + opName + "'").str().c_str());
 }

@@ -1,6 +1,7 @@
 #ifndef TRITON_TV_SEMANTICS_STATE_H
 #define TRITON_TV_SEMANTICS_STATE_H
 
+#include "semantics/AbstractFp.h"
 #include "semantics/Env.h"
 #include "semantics/Memory.h"
 
@@ -9,6 +10,7 @@
 #include "mlir/IR/ValueRange.h"
 
 #include <map>
+#include <memory>
 #include <z3++.h>
 
 namespace Semantics {
@@ -36,7 +38,20 @@ public:
 
   // Future: Memory sharedMem;  // for TTGIR ttg.local_alloc / ttg.local_store
 
-  State(Env env, std::map<mlir::Value, Memory, ValuePtrLess> ptrMems);
+  // Shared Z3 context for all expressions in this state.
+  z3::context &ctx;
+
+  // FP encoding mode for this interpretation run.
+  FPMode fpMode;
+
+  // Registry of AbstractFp objects (uninterpreted FP function declarations).
+  // Shared across all States derived from the same initFromFunc call so that
+  // axiom emission is idempotent and function names are consistent.
+  std::shared_ptr<AbstractFpRegistry> fpReg;
+
+  State(Env env, std::map<mlir::Value, Memory, ValuePtrLess> ptrMems,
+        z3::context &ctx, FPMode fpMode,
+        std::shared_ptr<AbstractFpRegistry> fpReg);
 
   // Factory: build an initial State from a function's argument list.
   //

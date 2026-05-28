@@ -24,11 +24,41 @@ endif()
 
 get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
 
+# ---------------------------------------------------------------------------
+# TritonTVSemantics — static library compiled WITHOUT -fno-exceptions/-fno-rtti
+# so that std::throw (used in Env::lookup) works normally.
+# ---------------------------------------------------------------------------
+add_library(TritonTVSemantics STATIC
+  semantics/AbstractFp.cpp
+  semantics/Env.cpp
+  semantics/Memory.cpp
+  semantics/State.cpp
+  semantics/mlir/ArithOps.cpp
+  semantics/mlir/TritonOps.cpp
+)
+
+target_include_directories(TritonTVSemantics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(TritonTVSemantics PUBLIC
+  ${triton_libs}
+  MLIRIR
+  MLIRSupport
+)
+
+if(TARGET z3::libz3)
+  target_link_libraries(TritonTVSemantics PUBLIC z3::libz3)
+else()
+  target_include_directories(TritonTVSemantics PUBLIC ${Z3_INCLUDE_DIRS})
+  target_link_libraries(TritonTVSemantics PUBLIC ${Z3_LIBRARIES})
+endif()
+
+# ---------------------------------------------------------------------------
+# triton-tv binary
+# ---------------------------------------------------------------------------
 add_executable(triton-tv triton-tv.cpp)
 
 target_compile_options(triton-tv PRIVATE ${TRITON_DISABLE_EH_RTTI_FLAGS})
 target_link_libraries(triton-tv PRIVATE
-  ${triton_libs}
+  TritonTVSemantics
   # tests
   TritonTestAnalysis
   TritonTestDialect
