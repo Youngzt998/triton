@@ -1,3 +1,11 @@
+# Active Project: Bitwise Equivalence & Triton Autotuning
+
+When working on the bitwise-equivalence / constraint-aware-autotuning project,
+follow the project-scoped guide (goals, milestones, guardrails, knowledge-base
+and session-summary conventions):
+
+@bitequiv/CLAUDE.md
+
 # Codebase Architecture
 
 ## Compilation Pipeline
