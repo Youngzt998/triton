@@ -3,19 +3,28 @@
 #include <cstdint>
 #include <map>
 #include <stdexcept>
+#include <string>
 #include <variant>
+#include <vector>
 
-#include "pybind11/pybind11.h"
-#include "pybind11/stl.h"
-#include "pybind11/stl_bind.h"
+#include "Backend/Backend.h"
+#include "Context/Context.h"
+#include "Session/Session.h"
+#include <nanobind/nanobind.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/variant.h>
+#include <nanobind/stl/vector.h>
 
 using namespace proton;
 
-// For simplicity, the Python interface restricts metrics to int64_t and double.
-// without uint64_t. Allowing types such as uint64_t vs. int64_t would force
-// users to handle subtle type differences for the same metric name, which would
-// be confusing and error-prone.
-using PythonMetricValueType = std::variant<int64_t, double>;
+// For simplicity, the Python interface restricts *scalar* metrics to int64_t
+// and double (i.e. no uint64_t) to avoid subtle signed-vs-unsigned differences
+// for the same metric name. For vector-valued (FlexibleMetric) metrics, mirror
+// the scalar restriction (int64_t / double).
+using PythonMetricValueType =
+    std::variant<int64_t, double, std::vector<int64_t>, std::vector<double>>;
 namespace {
 
 std::map<std::string, MetricValueType> convertPythonMetrics(
@@ -33,30 +42,45 @@ std::map<std::string, MetricValueType> convertPythonMetrics(
 
 } // namespace
 
-static void initProton(pybind11::module &&m) {
-  using ret = pybind11::return_value_policy;
-  using namespace pybind11::literals;
+static void initProton(nanobind::module_ &m) {
+  using ret = nanobind::rv_policy;
+  using namespace nanobind::literals;
 
   // Accept raw integer pointers from Python (e.g., Tensor.data_ptr()) instead
   // of requiring a PyCapsule, which matches how tensor metric values are passed
   // in transform_tensor_metrics.
-  pybind11::class_<TensorMetric>(m, "TensorMetric")
-      .def(pybind11::init<>())
-      .def(pybind11::init([](uintptr_t ptr, size_t index) {
-             return TensorMetric{reinterpret_cast<uint8_t *>(ptr), index};
+  nanobind::class_<TensorMetric>(m, "TensorMetric")
+      .def(nanobind::init<>())
+      .def(nanobind::new_([](uintptr_t ptr, size_t typeIndex, uint64_t size) {
+             return new TensorMetric{reinterpret_cast<uint8_t *>(ptr),
+                                     typeIndex, size};
            }),
-           pybind11::arg("ptr"), pybind11::arg("index"))
-      .def_property_readonly("ptr",
-                             [](const TensorMetric &metric) {
-                               return reinterpret_cast<uintptr_t>(metric.ptr);
-                             })
-      .def_property_readonly(
-          "index", [](const TensorMetric &metric) { return metric.index; });
+           nanobind::arg("ptr"), nanobind::arg("index"),
+           nanobind::arg("size") = 1)
+      .def_prop_ro("ptr",
+                   [](const TensorMetric &metric) {
+                     return reinterpret_cast<uintptr_t>(metric.ptr);
+                   })
+      .def_prop_ro("index",
+                   [](const TensorMetric &metric) { return metric.typeIndex; })
+      .def_prop_ro("size",
+                   [](const TensorMetric &metric) { return metric.size; });
 
-  m.attr("metric_int64_index") =
-      pybind11::cast(variant_index_v<int64_t, MetricValueType>);
-  m.attr("metric_double_index") =
-      pybind11::cast(variant_index_v<double, MetricValueType>);
+  auto metricTypeInt64Index =
+      nanobind::cast(variant_index_v<int64_t, MetricValueType>);
+  auto metricTypeDoubleIndex =
+      nanobind::cast(variant_index_v<double, MetricValueType>);
+  auto metricTypeVectorInt64Index =
+      nanobind::cast(variant_index_v<std::vector<int64_t>, MetricValueType>);
+  auto metricTypeVectorDoubleIndex =
+      nanobind::cast(variant_index_v<std::vector<double>, MetricValueType>);
+
+  m.attr("metadata_scope_name") = std::string(kMetadataScopeName);
+  m.attr("metadata_scope_prefix") = std::string(kMetadataScopePrefix);
+  m.attr("metric_type_int64_index") = metricTypeInt64Index;
+  m.attr("metric_type_double_index") = metricTypeDoubleIndex;
+  m.attr("metric_type_vector_int64_index") = metricTypeVectorInt64Index;
+  m.attr("metric_type_vector_double_index") = metricTypeVectorDoubleIndex;
 
   m.def(
       "start",
@@ -68,9 +92,9 @@ static void initProton(pybind11::module &&m) {
         SessionManager::instance().activateSession(sessionId);
         return sessionId;
       },
-      pybind11::arg("path"), pybind11::arg("contextSourceName"),
-      pybind11::arg("dataName"), pybind11::arg("profilerName"),
-      pybind11::arg("mode") = "");
+      nanobind::arg("path"), nanobind::arg("contextSourceName"),
+      nanobind::arg("dataName"), nanobind::arg("profilerName"),
+      nanobind::arg("mode") = "");
 
   m.def("activate", [](size_t sessionId) {
     SessionManager::instance().activateSession(sessionId);
@@ -122,6 +146,9 @@ static void initProton(pybind11::module &&m) {
               functionId, functionName, scopeIdNames, scopeIdParents,
               metadataPath);
         });
+  m.def("destroy_function_metadata", [](uint64_t functionId) {
+    SessionManager::instance().destroyFunctionMetadata(functionId);
+  });
 
   m.def("enter_instrumented_op", [](uint64_t streamId, uint64_t functionId,
                                     uint64_t buffer, size_t size) {
@@ -151,17 +178,33 @@ static void initProton(pybind11::module &&m) {
         SessionManager::instance().addMetrics(scopeId, convertedMetrics,
                                               tensorMetrics);
       },
-      pybind11::arg("scopeId"), pybind11::arg("metrics"),
-      pybind11::arg("tensorMetrics") = std::map<std::string, TensorMetric>());
+      nanobind::arg("scopeId"), nanobind::arg("metrics"),
+      nanobind::arg("tensorMetrics") = std::map<std::string, TensorMetric>());
 
-  m.def("set_metric_kernels",
-        [](uintptr_t tensorMetricKernel, uintptr_t scalarMetricKernel,
-           uintptr_t stream) {
-          SessionManager::instance().setMetricKernels(
-              reinterpret_cast<void *>(tensorMetricKernel),
-              reinterpret_cast<void *>(scalarMetricKernel),
-              reinterpret_cast<void *>(stream));
-        });
+  m.def(
+      "set_metric_kernels",
+      [](uintptr_t tensorMetricKernel, uintptr_t scalarMetricKernel,
+         uintptr_t stream, unsigned int tensorMetricKernelNumThreads,
+         unsigned int tensorMetricKernelSharedMemBytes,
+         unsigned int scalarMetricKernelNumThreads,
+         unsigned int scalarMetricKernelSharedMemBytes) {
+        MetricKernelLaunchState metricKernelLaunchState{
+            MetricKernelLaunchConfig{
+                reinterpret_cast<void *>(tensorMetricKernel),
+                reinterpret_cast<void *>(stream), tensorMetricKernelNumThreads,
+                tensorMetricKernelSharedMemBytes},
+            MetricKernelLaunchConfig{
+                reinterpret_cast<void *>(scalarMetricKernel),
+                reinterpret_cast<void *>(stream), scalarMetricKernelNumThreads,
+                scalarMetricKernelSharedMemBytes}};
+        SessionManager::instance().setMetricKernels(metricKernelLaunchState);
+      },
+      nanobind::arg("tensorMetricKernel"), nanobind::arg("scalarMetricKernel"),
+      nanobind::arg("stream"),
+      nanobind::arg("tensorMetricKernelNumThreads") = 1,
+      nanobind::arg("tensorMetricKernelSharedMemBytes") = 0,
+      nanobind::arg("scalarMetricKernelNumThreads") = 1,
+      nanobind::arg("scalarMetricKernelSharedMemBytes") = 0);
 
   m.def("get_context_depth", [](size_t sessionId) {
     return SessionManager::instance().getContextDepth(sessionId);
@@ -172,38 +215,53 @@ static void initProton(pybind11::module &&m) {
       [](size_t sessionId, size_t phase) {
         return SessionManager::instance().getData(sessionId, phase);
       },
-      pybind11::arg("sessionId"), pybind11::arg("phase"));
+      nanobind::arg("sessionId"), nanobind::arg("phase"));
 
   m.def(
       "get_data_msgpack",
       [](size_t sessionId, size_t phase) {
         auto data = SessionManager::instance().getDataMsgPack(sessionId, phase);
-        return pybind11::bytes(reinterpret_cast<const char *>(data.data()),
+        return nanobind::bytes(reinterpret_cast<const char *>(data.data()),
                                data.size());
       },
-      pybind11::arg("sessionId"), pybind11::arg("phase"));
+      nanobind::arg("sessionId"), nanobind::arg("phase"));
   m.def(
       "clear_data",
       [](size_t sessionId, size_t phase, bool clearUpToPhase) {
         SessionManager::instance().clearData(sessionId, phase, clearUpToPhase);
       },
-      pybind11::arg("sessionId"), pybind11::arg("phase"),
-      pybind11::arg("clearUpToPhase") = false);
+      nanobind::arg("sessionId"), nanobind::arg("phase"),
+      nanobind::arg("clearUpToPhase") = false);
   m.def(
       "advance_data_phase",
       [](size_t sessionId) {
         return SessionManager::instance().advanceDataPhase(sessionId);
       },
-      pybind11::arg("sessionId"));
+      nanobind::arg("sessionId"));
   m.def(
       "is_data_phase_complete",
       [](size_t sessionId, size_t phase) {
         return SessionManager::instance().isDataPhaseComplete(sessionId, phase);
       },
-      pybind11::arg("sessionId"), pybind11::arg("phase"));
+      nanobind::arg("sessionId"), nanobind::arg("phase"));
+  m.def("get_available_profilers",
+        []() { return getRegisteredProfilerNames(); });
+  m.def(
+      "select_profiler_from_triton_backend",
+      [](const std::string &tritonBackend) {
+        const auto profiler = getProfilerForTritonBackend(tritonBackend);
+        if (profiler.has_value()) {
+          return profiler.value();
+        }
+        auto message =
+            "No profiler registered for triton backend " + tritonBackend;
+        throw nanobind::value_error(message.c_str());
+      },
+      nanobind::arg("tritonBackend"));
 }
 
-PYBIND11_MODULE(libproton, m) {
+NB_MODULE(libproton, m) {
   m.doc() = "Python bindings to the Proton API";
-  initProton(std::move(m.def_submodule("proton")));
+  auto proton_m = m.def_submodule("proton");
+  initProton(proton_m);
 }

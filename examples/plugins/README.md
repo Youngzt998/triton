@@ -17,8 +17,8 @@ long as the libtriton.so is linked to the plugin and the Triton include passes a
 
 ## Example 1: Developing a custom pass and running triton-opt to inspect the modified IR
 ``` bash
-export LLVM_BUILD_SHARED_LIBS=1;  make dev-install-llvm
-TRITON_PASS_PLUGIN_PATH=/home/triton/python/triton/plugins/libTritonPluginsTestLib.so triton-opt -tritongpu-plugin test/Plugins/test-plugin.mlir
+export TRITON_EXT_ENABLED=1;  make dev-install-llvm
+TRITON_PLUGIN_PATHS=/home/triton/python/triton/plugins/libTritonPluginsTestLib.so triton-opt -tritongpu-plugin test/Plugins/test-plugin.mlir
 ```
 ``` MLIR
 module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:80"} {
@@ -85,7 +85,7 @@ Running same code but loading the plugin library also produces the same results 
 pass manager it is not inserted into the compiler pass pipeline:
 
 ``` bash
-TRITON_PASS_PLUGIN_PATH=/home/triton/python/triton/plugins/libTritonPluginsTestLib.so python test.py
+TRITON_PLUGIN_PATHS=/home/triton/python/triton/plugins/libTritonPluginsTestLib.so python test.py
 ```
 
 ``` MLIR
@@ -151,7 +151,7 @@ if __name__ == '__main__':
     h = kernel[grid](BLOCK_SIZE=1024)
     print(h.asm["ttgir"])
 
-    if "TRITON_PASS_PLUGIN_PATH" in os.environ:
+    if "TRITON_PLUGIN_PATHS" in os.environ:
       knobs.runtime.add_stages_inspection_hook = inspect_stages_hook
     h = kernel[grid](BLOCK_SIZE=1024)
     print(h.asm["ttgir"])
@@ -163,7 +163,7 @@ if __name__ == '__main__':
 ```
 
 ``` bash
-TRITON_PASS_PLUGIN_PATH=/home/triton/python/triton/plugins/libTritonPluginsTestLib.so python test.py
+TRITON_PLUGIN_PATHS=/home/triton/python/triton/plugins/libTritonPluginsTestLib.so python test.py
 ```
 
 Shows the pass ran and modified the kernel name but only after the hook is set. Any kernels before the hook or after the hook is unset are left unchanged.
@@ -194,14 +194,14 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 #loc1 = loc("/home/triton/test.py":14:4)
 ```
 
-The hook, as defined, in the example will insert the pass at the end of the make_ttir pipeline but it's placement in the Triton pipeline is abritary.
+The hook, as defined, in the example will insert the pass at the end of the make_ttir pipeline but it's placement in the Triton pipeline is arbitrary.
 This functionality can be toggled on and off by just commenting out this line in kernel code (or setting to None):
 knobs.runtime.add_stages_inspection_hook = inspect_stages_hook
 without needing any core compiler changes or rebuilding Triton.
 
-## Example 3: Inserting a new pass into the compiler pipeline at an arbitary point.
+## Example 3: Inserting a new pass into the compiler pipeline at an arbitrary point.
 
-Example 2 added a new pass to the end of the ttgir "stage". However the plugin pass's location is arbitary and can be dynamically inserted anywhere in the pipeline. Replacing the inspect_stages_hook function from example 2 instead with:
+Example 2 added a new pass to the end of the ttgir "stage". However the plugin pass's location is arbitrary and can be dynamically inserted anywhere in the pipeline. Replacing the inspect_stages_hook function from example 2 instead with:
 
 ```python
 def inspect_stages_hook(self=None, stages=None, options=None, language=None, capability=None):
@@ -223,9 +223,9 @@ def inspect_stages_hook(self=None, stages=None, options=None, language=None, cap
     stages["ttir"] = make_lambda(module.make_ttir)
     return get_key(), get_hash()
 ```
-directs the new pass's placement based on other surrounding passes. Knowing which passes are in the pipeline a priori can challenging, therefore in the next example we show how to dump and inspect the entire pipeline that is run for a particlar kernel to allow for precise placement of specialized out of tree passes even if the upstream pass pipeline structure changes.
+directs the new pass's placement based on other surrounding passes. Knowing which passes are in the pipeline a priori can be challenging, therefore in the next example we show how to dump and inspect the entire pipeline that is run for a particular kernel to allow for precise placement of specialized out of tree passes even if the upstream pass pipeline structure changes.
 
-## Example 4: Fully customizing the compiler pipeline with pass and op insertions at abitrary locations
+## Example 4: Fully customizing the compiler pipeline with pass and op insertions at arbitrary locations
 
 Here we now run two kernels one with the full standard Triton pipeline and one with fully customized pipeline entirely from within
 kernel code with modifying any core Triton compiler code or recompiling. We run the kernel with a hook to output the standard pipeline, modify
@@ -330,7 +330,7 @@ if __name__ == '__main__':
             if "add_loop_unroll" in line:
                 outfile.write("\n        passes.plugin.add_plugin(pm)\n")
             outfile.write(line)
-    if "TRITON_PASS_PLUGIN_PATH" in os.environ:
+    if "TRITON_PLUGIN_PATHS" in os.environ:
       knobs.runtime.add_stages_inspection_hook = override_stages
     h = kernel2[grid](BLOCK_SIZE=1024)
     print(h.asm["ttgir"])

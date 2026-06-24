@@ -200,8 +200,9 @@ static LogicalResult optimizePartitionNumWarps(ModuleAxisInfoAnalysis &axisInfo,
     region->walk([minWarps = &minWarps](Operation *op) {
       // Some instructions have critical throughput if have low register usage.
       // Make sure there are enough warps for these ops to execute quickly.
-      if (isa<ttng::AsyncTMAGatherOp, ttng::AsyncTMAScatterOp,
-              ttng::AsyncTMACopyGlobalToLocalOp>(op))
+      // TMAStoreLikeOps stay in the main partition, so they should not appear
+      // in partition regions here.
+      if (isa<ttng::TMALoadLikeOpInterface>(op))
         *minWarps = 2;
       // TMEM ops require at least 4 warps to be able to read all lanes.
       else if (isa<ttng::TMEMLoadOp, ttng::TMEMStoreOp, ttng::TMEMAllocOp>(op))
@@ -306,7 +307,7 @@ void OptimizePartitionWarps::runOnOperation() {
     // The module must be directly nested under the current op for `runPipeline`
     // to work.
     getOperation().push_back(container);
-    auto remove = llvm::make_scope_exit([&] { container->remove(); });
+    llvm::scope_exit remove([&] { container->remove(); });
     return runPipeline(pm, container);
   };
 

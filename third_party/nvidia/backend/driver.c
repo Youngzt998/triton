@@ -10,7 +10,7 @@
 
 typedef struct {
   PyObject_HEAD;
-  _Alignas(128) CUtensorMap tensorMap;
+  _Alignas(alignof(CUtensorMap)) CUtensorMap tensorMap;
 } PyCUtensorMapObject;
 
 typedef enum { ARG_CONSTEXPR = 0, ARG_KERNEL = 1, ARG_TUPLE = 2 } ArgType;
@@ -110,6 +110,18 @@ static bool gpuAssert(CUresult code, const char *file, int line) {
     }                                                                          \
   } while (0)
 
+static void ensureCudaContext() {
+  CUcontext pctx;
+  CUDA_CHECK(cuCtxGetCurrent(&pctx));
+  if (!pctx) {
+    // Ensure device context.
+    CUdevice device;
+    CUDA_CHECK(cuDeviceGet(&device, 0));
+    CUDA_CHECK(cuDevicePrimaryCtxRetain(&pctx, device));
+    CUDA_CHECK(cuCtxSetCurrent(pctx));
+  }
+}
+
 static PyObject *getDeviceProperties(PyObject *self, PyObject *args) {
   int device_id;
   if (!PyArg_ParseTuple(args, "i", &device_id))
@@ -151,6 +163,77 @@ static PyObject *getDeviceProperties(PyObject *self, PyObject *args) {
 
 cleanup:
   return NULL;
+}
+
+static PyObject *getDeviceCapability(PyObject *self, PyObject *args) {
+  int device_id;
+  if (!PyArg_ParseTuple(args, "i", &device_id))
+    return NULL;
+
+  CUdevice device;
+  int major;
+  int minor;
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGet(&device, device_id));
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetAttribute(
+      &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
+  CUDA_CHECK_AND_RETURN_NULL(cuDeviceGetAttribute(
+      &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
+
+  return Py_BuildValue("(ii)", major, minor);
+
+cleanup:
+  return NULL;
+}
+
+static PyObject *getCurrentDevice(PyObject *self, PyObject *args) {
+  if (!PyArg_ParseTuple(args, "")) {
+    return NULL;
+  }
+
+  ensureCudaContext();
+  if (PyErr_Occurred()) {
+    return NULL;
+  }
+
+  CUdevice device;
+  CUDA_CHECK_AND_RETURN_NULL(cuCtxGetDevice(&device));
+  return PyLong_FromLong(device);
+
+cleanup:
+  return NULL;
+}
+
+static PyObject *setCurrentDevice(PyObject *self, PyObject *args) {
+  int device;
+  if (!PyArg_ParseTuple(args, "i", &device)) {
+    return NULL;
+  }
+
+  CUcontext pctx = 0;
+  Py_BEGIN_ALLOW_THREADS;
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
+      cuDevicePrimaryCtxRetain(&pctx, device));
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuCtxSetCurrent(pctx));
+  Py_END_ALLOW_THREADS;
+
+  Py_RETURN_NONE;
+}
+
+static PyObject *getDefaultStream(PyObject *self, PyObject *args) {
+  int device;
+  if (!PyArg_ParseTuple(args, "i", &device)) {
+    return NULL;
+  }
+
+  CUcontext pctx = 0;
+  Py_BEGIN_ALLOW_THREADS;
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
+      cuDevicePrimaryCtxRetain(&pctx, device));
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuCtxSetCurrent(pctx));
+  Py_END_ALLOW_THREADS;
+
+  // CUDA default stream is always 0.
+  return PyLong_FromUnsignedLongLong(0);
 }
 
 static PyObject *loadBinary(PyObject *self, PyObject *args) {
@@ -217,6 +300,19 @@ static PyObject *loadBinary(PyObject *self, PyObject *args) {
                        n_spills, n_max_threads);
 }
 
+static PyObject *unloadModule(PyObject *self, PyObject *args) {
+  CUmodule mod;
+  if (!PyArg_ParseTuple(args, "K", &mod)) {
+    return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS;
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuModuleUnload(mod));
+  Py_END_ALLOW_THREADS;
+
+  return Py_None;
+}
+
 typedef CUresult (*cuOccupancyMaxActiveClusters_t)(
     int *numClusters, CUfunction func, const CUlaunchConfig *config);
 
@@ -227,6 +323,15 @@ typedef CUresult (*cuTensorMapEncodeTiled_t)(
     const cuuint32_t *elementStrides, CUtensorMapInterleave interleave,
     CUtensorMapSwizzle swizzle, CUtensorMapL2promotion l2Promotion,
     CUtensorMapFloatOOBfill oobFill);
+
+typedef CUresult (*cuTensorMapEncodeIm2col_t)(
+    CUtensorMap *tensorMap, CUtensorMapDataType tensorDataType,
+    cuuint32_t tensorRank, void *globalAddress, const cuuint64_t *globalDim,
+    const cuuint64_t *globalStrides, const int *pixelBoxLowerCorner,
+    const int *pixelBoxUpperCorner, cuuint32_t channelsPerPixel,
+    cuuint32_t pixelsPerColumn, const cuuint32_t *elementStrides,
+    CUtensorMapInterleave interleave, CUtensorMapSwizzle swizzle,
+    CUtensorMapL2promotion l2Promotion, CUtensorMapFloatOOBfill oobFill);
 
 typedef CUresult (*cuLaunchKernelEx_t)(const CUlaunchConfig *config,
                                        CUfunction f, void **kernelParams,
@@ -259,6 +364,9 @@ defineGetFunctionHandle(getCuOccupancyMaxActiveClustersHandle,
 
 defineGetFunctionHandle(getCuTensorMapEncodeTiledHandle,
                         cuTensorMapEncodeTiled);
+
+defineGetFunctionHandle(getCuTensorMapEncodeIm2colHandle,
+                        cuTensorMapEncodeIm2col);
 
 defineGetFunctionHandle(getLaunchKernelExHandle, cuLaunchKernelEx);
 
@@ -386,7 +494,7 @@ static PyTypeObject PyCUtensorMapType = {
 };
 // clang-format on
 
-static PyObject *fillTMADescriptor(PyObject *self, PyObject *args) {
+static PyObject *fillTMADescriptorTiled(PyObject *self, PyObject *args) {
   unsigned long long global_address;
   int swizzle;
   int elemSize;
@@ -555,16 +663,269 @@ cleanup:
   return NULL;
 }
 
-static void ensureCudaContext() {
-  CUcontext pctx;
-  CUDA_CHECK(cuCtxGetCurrent(&pctx));
-  if (!pctx) {
-    // Ensure device context.
-    CUdevice device;
-    CUDA_CHECK(cuDeviceGet(&device, 0));
-    CUDA_CHECK(cuDevicePrimaryCtxRetain(&pctx, device));
-    CUDA_CHECK(cuCtxSetCurrent(pctx));
+static PyObject *fillTMADescriptorIm2col(PyObject *self, PyObject *args) {
+  unsigned long long global_address;
+  int swizzle;
+  int elemSize;
+  int elemType;
+  PyObject *blockSize;
+  PyObject *shape;
+  PyObject *strides;
+  int padding;
+  PyObject *pixelBoxLower;
+  PyObject *pixelBoxUpper;
+  PyObject *elementStrides;
+
+  if (!PyArg_ParseTuple(args, "KiiiOOOiOOO", &global_address, &swizzle,
+                        &elemSize, &elemType, &blockSize, &shape, &strides,
+                        &padding, &pixelBoxLower, &pixelBoxUpper,
+                        &elementStrides)) {
+    return NULL;
   }
+
+  PyCUtensorMapObject *desc = (PyCUtensorMapObject *)PyObject_CallObject(
+      (PyObject *)&PyCUtensorMapType, NULL);
+  if (!desc) {
+    return NULL;
+  }
+
+  PyObject *blockSizeFast = NULL;
+  PyObject *shapeFast = NULL;
+  PyObject *stridesFast = NULL;
+  PyObject *pixelBoxLowerFast = NULL;
+  PyObject *pixelBoxUpperFast = NULL;
+  PyObject *elementStridesFast = NULL;
+
+  uint32_t blockSizeInt[5];
+  uint64_t shapeInt[5];
+  uint64_t stridesLL[5];
+  int pixelBoxLowerInt[5] = {0};
+  int pixelBoxUpperInt[5] = {0};
+  uint32_t elementStridesInt[5] = {1, 1, 1, 1, 1}; // Default to all 1s
+
+  // For im2col mode, shape determines the tensor rank, not blockSize
+  // blockSize is typically 2D [pixelsPerColumn, channelsPerPixel]
+  // while shape can be 4D or 5D (e.g., NHWC or NDHWC)
+  shapeFast = PySequence_Fast(shape, "shape must be a sequence");
+  if (!shapeFast)
+    goto cleanup;
+  int rank = PySequence_Fast_GET_SIZE(shapeFast);
+
+  for (int i = 0; i < rank; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(shapeFast, i);
+    if (!PyLong_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "shape must be an int");
+      goto cleanup;
+    }
+    shapeInt[rank - i - 1] = PyLong_AsLong(item);
+  }
+
+  blockSizeFast = PySequence_Fast(blockSize, "blockSize must be a sequence");
+  if (!blockSizeFast)
+    goto cleanup;
+  int blockRank = PySequence_Fast_GET_SIZE(blockSizeFast);
+  if (blockRank != 2) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "blockSize must have exactly 2 dimensions for im2col");
+    goto cleanup;
+  }
+
+  for (int i = 0; i < blockRank; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(blockSizeFast, i);
+    if (!PyLong_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "block size must be an int");
+      goto cleanup;
+    }
+    blockSizeInt[blockRank - i - 1] = PyLong_AsLongLong(item);
+  }
+
+  stridesFast = PySequence_Fast(strides, "strides must be a sequence");
+  if (!stridesFast)
+    goto cleanup;
+
+  if (rank != PySequence_Fast_GET_SIZE(stridesFast)) {
+    PyErr_Format(PyExc_RuntimeError,
+                 "Rank mismatch for strides in fillTMADescriptorIm2col: shape "
+                 "has rank %d but strides has %zd elements. "
+                 "Expected strides to have %d elements.",
+                 rank, PySequence_Fast_GET_SIZE(stridesFast), rank);
+    goto cleanup;
+  }
+  for (int i = 0; i + 1 < rank; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(stridesFast, i);
+    if (!PyLong_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "strides must be an int");
+      goto cleanup;
+    }
+    stridesLL[rank - i - 2] = elemSize * PyLong_AsLongLong(item);
+  }
+  stridesLL[rank - 1] =
+      shapeInt[rank - 1] * (rank == 1 ? elemSize : stridesLL[rank - 2]);
+
+  // Parse pixel box lower corner
+  pixelBoxLowerFast =
+      PySequence_Fast(pixelBoxLower, "pixelBoxLower must be a sequence");
+  if (!pixelBoxLowerFast)
+    goto cleanup;
+
+  int spatialRank = PySequence_Fast_GET_SIZE(pixelBoxLowerFast);
+  if (spatialRank > 5) {
+    PyErr_SetString(PyExc_RuntimeError, "Pixel box rank too large (max 5)");
+    goto cleanup;
+  }
+
+  for (int i = 0; i < spatialRank; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(pixelBoxLowerFast, i);
+    if (!PyLong_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "pixelBoxLower elements must be int");
+      goto cleanup;
+    }
+    pixelBoxLowerInt[spatialRank - i - 1] = PyLong_AsLong(item);
+  }
+
+  // Parse pixel box upper corner
+  pixelBoxUpperFast =
+      PySequence_Fast(pixelBoxUpper, "pixelBoxUpper must be a sequence");
+  if (!pixelBoxUpperFast)
+    goto cleanup;
+
+  if (spatialRank != PySequence_Fast_GET_SIZE(pixelBoxUpperFast)) {
+    PyErr_SetString(PyExc_RuntimeError, "Pixel box corner rank mismatch");
+    goto cleanup;
+  }
+
+  for (int i = 0; i < spatialRank; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(pixelBoxUpperFast, i);
+    if (!PyLong_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "pixelBoxUpper elements must be int");
+      goto cleanup;
+    }
+    pixelBoxUpperInt[spatialRank - i - 1] = PyLong_AsLong(item);
+  }
+
+  // Parse element strides
+  elementStridesFast =
+      PySequence_Fast(elementStrides, "elementStrides must be a sequence");
+  if (!elementStridesFast)
+    goto cleanup;
+
+  int elementStridesLen = PySequence_Fast_GET_SIZE(elementStridesFast);
+  if (elementStridesLen != rank) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "elementStrides length must match tensor rank");
+    goto cleanup;
+  }
+
+  for (int i = 0; i < rank; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(elementStridesFast, i);
+    if (!PyLong_Check(item)) {
+      PyErr_SetString(PyExc_TypeError, "elementStrides elements must be int");
+      goto cleanup;
+    }
+    elementStridesInt[rank - i - 1] = PyLong_AsLong(item);
+  }
+
+  Py_DECREF(blockSizeFast);
+  blockSizeFast = NULL;
+  Py_DECREF(shapeFast);
+  shapeFast = NULL;
+  Py_DECREF(stridesFast);
+  stridesFast = NULL;
+  Py_DECREF(pixelBoxLowerFast);
+  pixelBoxLowerFast = NULL;
+  Py_DECREF(pixelBoxUpperFast);
+  pixelBoxUpperFast = NULL;
+  Py_DECREF(elementStridesFast);
+  elementStridesFast = NULL;
+
+  CUtensorMapFloatOOBfill fill =
+      (padding == 1) ? CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA
+                     : CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
+
+  static cuTensorMapEncodeIm2col_t cuTensorMapEncodeIm2col = NULL;
+  INITIALIZE_FUNCTION_POINTER_IF_NULL(cuTensorMapEncodeIm2col,
+                                      getCuTensorMapEncodeIm2colHandle);
+
+  int channelsPerPixel = blockSizeInt[0];
+  int pixelsPerColumn = blockSizeInt[1];
+
+  CUresult res = cuTensorMapEncodeIm2col(
+      &desc->tensorMap, elemType, rank, (void *)global_address, shapeInt,
+      stridesLL, pixelBoxLowerInt, pixelBoxUpperInt, channelsPerPixel,
+      pixelsPerColumn, elementStridesInt, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_128B, fill);
+
+  if (res != CUDA_SUCCESS) {
+    const char *str;
+    cuGetErrorString(res, &str);
+    char err[4096] = {0};
+    size_t off = 0;
+    off += snprintf(err + off, sizeof(err) - off,
+                    "Triton Error [CUDA]: Failed to create im2col tensor map "
+                    "descriptor: %s\n",
+                    str ? str : "Unknown error");
+    off +=
+        snprintf(err + off, sizeof(err) - off,
+                 "elemType=%d rank=%d global_address=0x%llx elemSize=%d "
+                 "swizzle=%d padding=%d channelsPerPixel=%d "
+                 "pixelsPerColumn=%d\n",
+                 elemType, rank, (unsigned long long)global_address, elemSize,
+                 swizzle, padding, channelsPerPixel, pixelsPerColumn);
+    off += snprintf(err + off, sizeof(err) - off, "shape=[");
+    for (int i = 0; i < rank; ++i) {
+      off +=
+          snprintf(err + off, sizeof(err) - off, "%llu%s",
+                   (unsigned long long)shapeInt[i], (i + 1 < rank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "]\n");
+    off += snprintf(err + off, sizeof(err) - off, "strides=[");
+    for (int i = 0; i < rank; ++i) {
+      off += snprintf(err + off, sizeof(err) - off, "%llu%s",
+                      (unsigned long long)stridesLL[i],
+                      (i + 1 < rank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "]\n");
+    off += snprintf(err + off, sizeof(err) - off, "blockSize=[");
+    for (int i = 0; i < blockRank; ++i) {
+      off +=
+          snprintf(err + off, sizeof(err) - off, "%u%s",
+                   (unsigned)blockSizeInt[i], (i + 1 < blockRank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "]\n");
+    off += snprintf(err + off, sizeof(err) - off, "pixelBoxLower=[");
+    for (int i = 0; i < spatialRank; ++i) {
+      off += snprintf(err + off, sizeof(err) - off, "%d%s", pixelBoxLowerInt[i],
+                      (i + 1 < spatialRank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "] pixelBoxUpper=[");
+    for (int i = 0; i < spatialRank; ++i) {
+      off += snprintf(err + off, sizeof(err) - off, "%d%s", pixelBoxUpperInt[i],
+                      (i + 1 < spatialRank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "]\n");
+    off += snprintf(err + off, sizeof(err) - off, "elementStrides=[");
+    for (int i = 0; i < rank; ++i) {
+      off +=
+          snprintf(err + off, sizeof(err) - off, "%u%s",
+                   (unsigned)elementStridesInt[i], (i + 1 < rank) ? ", " : "");
+    }
+    off += snprintf(err + off, sizeof(err) - off, "]\n");
+    PyErr_SetString(PyExc_RuntimeError, err);
+
+    goto cleanup;
+  }
+
+  return (PyObject *)desc;
+
+cleanup:
+  Py_XDECREF(blockSizeFast);
+  Py_XDECREF(shapeFast);
+  Py_XDECREF(stridesFast);
+  Py_XDECREF(pixelBoxLowerFast);
+  Py_XDECREF(pixelBoxUpperFast);
+  Py_XDECREF(elementStridesFast);
+  Py_XDECREF(desc);
+  return NULL;
 }
 
 static void _launch(int gridX, int gridY, int gridZ, int num_warps,
@@ -767,12 +1128,14 @@ bool extractTmaDesc(void *ptr, PyObject *obj) {
     return false;
   }
   *((CUtensorMap *)ptr) = ((PyCUtensorMapObject *)obj)->tensorMap;
-  uintptr_t align_128 = (uintptr_t)ptr & (128 - 1);
-  if (align_128 != 0) {
+  // Depending on the cuda version, alignof(CUtensorMap) may be 64 or 128.
+  size_t alignment = alignof(CUtensorMap);
+  uintptr_t remainder = (uintptr_t)ptr & (alignment - 1);
+  if (remainder != 0) {
     PyErr_Format(
         PyExc_ValueError,
-        "CUtensorMap must be aligned to 128B, but got (&map) mod 128 = %ld",
-        align_128);
+        "CUtensorMap must be aligned to %ld, but got (&map) mod %ld = %ld",
+        alignment, alignment, remainder);
     return false;
   }
   return true;
@@ -1118,8 +1481,18 @@ cleanup:
 static PyMethodDef ModuleMethods[] = {
     {"load_binary", loadBinary, METH_VARARGS,
      "Load provided cubin into CUDA driver"},
+    {"unload_module", unloadModule, METH_VARARGS,
+     "Unload provided module to free memory"},
+    {"get_device_capability", getDeviceCapability, METH_VARARGS,
+     "Get compute capability (major, minor) for a given device"},
     {"get_device_properties", getDeviceProperties, METH_VARARGS,
      "Get the properties for a given device"},
+    {"get_current_device", getCurrentDevice, METH_VARARGS,
+     "Get the current CUDA device index"},
+    {"set_current_device", setCurrentDevice, METH_VARARGS,
+     "Set the current CUDA device index"},
+    {"get_default_stream", getDefaultStream, METH_VARARGS,
+     "Get the CUDA default stream for torch-free launches"},
     {"cuOccupancyMaxActiveClusters", occupancyMaxActiveClusters, METH_VARARGS,
      "Python interface for cuOccupancyMaxActiveClusters function"},
     {"set_printf_fifo_size", setPrintfFifoSize, METH_VARARGS,
@@ -1128,7 +1501,10 @@ static PyMethodDef ModuleMethods[] = {
      "being dropped.  This inherits all the limitations of this call; in "
      "particular it's an error to change this value after launching any kernel "
      "that calls printf()."},
-    {"fill_tma_descriptor", fillTMADescriptor, METH_VARARGS, "doc"},
+    {"fill_tma_descriptor_tiled", fillTMADescriptorTiled, METH_VARARGS,
+     "Create TMA descriptor for tiled mode"},
+    {"fill_tma_descriptor_im2col", fillTMADescriptorIm2col, METH_VARARGS,
+     "Create TMA descriptor for im2col mode"},
     {"build_signature_metadata", buildSignatureMetadata, METH_VARARGS,
      "Calling it with a signature list (ex: ['*fp32', 'u8', 'nvTmaDesc']), "
      "will return metadata to be passed into 'launch' for quicker "

@@ -25,9 +25,10 @@ namespace mlir::triton {
 
 namespace mlir::triton::AMD {
 
-std::unique_ptr<OperationPass<ModuleOp>> createConvertWarpPipelinePass();
 std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPUConvertWarpSpecializeToLLVMPass(StringRef arch);
+createConvertWarpPipelinePass(StringRef gfxArch);
+std::unique_ptr<OperationPass<ModuleOp>>
+createTritonAMDGPUConvertWarpSpecializeToLLVMPass(StringRef gfxArch);
 void runScalarizePackedFOpsPass(llvm::Function &F);
 
 } // namespace mlir::triton::AMD
@@ -35,14 +36,12 @@ void runScalarizePackedFOpsPass(llvm::Function &F);
 namespace mlir::triton {
 
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertTritonAMDGPUToLLVMPass(StringRef targetArch, bool ftz);
+createConvertTritonAMDGPUToLLVMPass(StringRef gfxArch, bool ftz);
 std::unique_ptr<OperationPass<ModuleOp>>
-createConvertBuiltinFuncToLLVMPass(bool ftz);
+createConvertBuiltinFuncToLLVMPass(StringRef gfxArch, bool ftz);
+
 std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPUInsertInstructionSchedHintsPass(StringRef variant);
-std::unique_ptr<OperationPass<ModuleOp>>
-createTritonAMDGPULowerInstructionSchedHintsPass(StringRef arch,
-                                                 int32_t numStages);
+createAllocateAMDGPUSharedMemoryPass(StringRef arch);
 
 #define GEN_PASS_REGISTRATION
 #include "TritonAMDGPUToLLVM/Passes.h.inc"

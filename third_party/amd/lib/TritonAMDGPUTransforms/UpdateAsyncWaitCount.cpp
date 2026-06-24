@@ -1,11 +1,14 @@
 #include "Dialect/TritonAMDGPU/IR/Dialect.h"
+#include "Dialect/TritonAMDGPU/IR/TargetFeatures.h"
 #include "TritonAMDGPUTransforms/Passes.h"
+#include "amd/lib/TritonAMDGPUToLLVM/TDMUtility.h"
 #include "amd/lib/TritonAMDGPUToLLVM/Utility.h"
 #include "amd/lib/TritonAMDGPUTransforms/Utility.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include <limits>
 
 // This pass computes, for each AsyncWait, the number of outstanding async
@@ -42,6 +45,7 @@
 
 namespace tt = triton;
 namespace ttg = triton::gpu;
+using mlir::triton::amdgpu::TargetFeatures;
 
 namespace mlir {
 
@@ -56,41 +60,83 @@ namespace {
 // mapping between global and shared memory addresses.
 int getNumberOfAsyncCopyInstructions(RankedTensorType globalType,
                                      ttg::MemDescType sharedType, Value mask,
-                                     int contig,
-                                     ModuleAxisInfoAnalysis &axisInfo) {
+                                     int ptrContig, int contigHint,
+                                     ModuleAxisInfoAnalysis &axisInfo,
+                                     const TargetFeatures &targetFeatures,
+                                     bool isStore) {
   LinearLayout globalLayout = tt::gpu::toLinearLayout(globalType);
-  LinearLayout sharedLayout;
-  if (auto paddedEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(
-          sharedType.getEncoding())) {
-    sharedLayout = paddedEnc.getLinearComponent();
-  } else {
-    sharedLayout = triton::gpu::toLinearLayout(sharedType);
-  }
+  triton::LinearLayout sharedLayout =
+      triton::gpu::isPaddedEncoding(sharedType.getEncoding())
+          ? paddedLinearLayout(sharedType)
+          : toLinearLayout(sharedType);
   LinearLayout globalToSharedLayout =
       globalLayout.invertAndCompose(sharedLayout);
-  contig = std::min(contig, globalToSharedLayout.getNumConsecutiveInOut());
 
+  // If the warp dimension has free variables, not all warps execute this async
+  // copy — the lowering will predicate execution to canonical warps only (via
+  // emitRedundantThreadPredicate + emitBranch). Non-canonical warps branch over
+  // the buffer_load instructions entirely, so their vmcnt is not incremented.
+  auto kWarp = StringAttr::get(globalType.getContext(), "warp");
+  if (globalToSharedLayout.getFreeVariableMasks().lookup(kWarp) != 0) {
+    return 0;
+  }
+
+  // We progressively tighten the pointer contiguity to mirror the lowering of
+  // async ops, starting with the mask alignment.
   if (mask)
-    contig = std::min<int>(contig, axisInfo.getMaskAlignment(mask));
+    ptrContig = std::min<int>(ptrContig, axisInfo.getMaskAlignment(mask));
 
-  // Divide number of registers by contig to get the number of async intrinsics
-  int numberOfRegisters = globalToSharedLayout.getInDimSize(
-      StringAttr::get(globalType.getContext(), "register"));
-  return std::max(1, numberOfRegisters / contig);
+  // Ops may carry a contiguity hint that raises the contiguity beyond what
+  // the pointer and mask axis info analysis can prove.
+  ptrContig = std::max<int>(ptrContig, contigHint);
+
+  // The global-to-shared layout limits the consecutive elements which can be
+  // transferred by a single async intrinsic.
+  ptrContig =
+      std::min(ptrContig, globalToSharedLayout.getNumConsecutiveInOut());
+
+  // For padded layouts the padding interval limits the vectorization.
+  auto srcEnc = sharedType.getEncoding();
+  if (auto padEnc = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(srcEnc)) {
+    ptrContig = std::min<int>(ptrContig, padEnc.getMinInterval());
+  }
+
+  // Divide number of registers by contig to get the number of async intrinsics.
+  // Strip zero bases from the register dimension first — a zero basis means
+  // multiple register indices map to the same offset, so no additional load
+  // instruction is generated.
+  auto kReg = StringAttr::get(globalType.getContext(), "register");
+  int numberOfRegisters =
+      globalToSharedLayout.removeZeroBasesAlongDim(kReg).getInDimSize(kReg);
+  int numInstructions = std::max(1, numberOfRegisters / ptrContig);
+
+  // When a given vector width is unsupported but half of it is, the store
+  // lowering splits each async store into two half-width stores.
+  if (isStore) {
+    int elemBitWidth = sharedType.getElementType().getIntOrFloatBitWidth();
+    int vecBits = ptrContig * elemBitWidth;
+    if (!targetFeatures.supportsDirectFromLdsStoreBitWidth(vecBits) &&
+        targetFeatures.supportsDirectFromLdsStoreBitWidth(vecBits / 2)) {
+      numInstructions *= 2;
+    }
+  }
+
+  return numInstructions;
 }
 
 // Return the number of generated intrinsics for async ops; 0 otherwise
 // If emitRemarkOnNonAsyncOp is set for any non async op having a side effect on
 // GlobalMemory an performance remark will be emitted
 int getOpNumberOfAsyncCopyInstructions(Operation *op,
-                                       AMD::TargetInfo targetInfo,
+                                       const TargetFeatures &targetFeatures,
                                        ModuleAxisInfoAnalysis &axisInfo,
                                        bool emitRemarkOnNonAsyncOp) {
   if (auto copyOp = dyn_cast<ttg::AsyncCopyGlobalToLocalOp>(op)) {
     int contig = LLVM::AMD::getVectorSize(copyOp.getSrc(), axisInfo);
-    return getNumberOfAsyncCopyInstructions(copyOp.getSrc().getType(),
-                                            copyOp.getResult().getType(),
-                                            copyOp.getMask(), contig, axisInfo);
+    return getNumberOfAsyncCopyInstructions(
+        copyOp.getSrc().getType(), copyOp.getResult().getType(),
+        copyOp.getMask(), contig, copyOp.getContiguity(), axisInfo,
+        targetFeatures, /*isStore=*/false);
   } else if (auto bufferOp = dyn_cast<amdgpu::BufferLoadToLocalOp>(op)) {
     auto ptrType = cast<RankedTensorType>(LLVM::AMD::getPointerTypeWithShape(
         bufferOp.getPtr(), bufferOp.getOffsets()));
@@ -98,12 +144,14 @@ int getOpNumberOfAsyncCopyInstructions(Operation *op,
                                           bufferOp.getOffsets(), axisInfo);
     return getNumberOfAsyncCopyInstructions(
         ptrType, bufferOp.getDest().getType(), bufferOp.getMask(), contig,
-        axisInfo);
+        bufferOp.getContiguity(), axisInfo, targetFeatures,
+        /*isStore=*/false);
   } else if (auto copyOp = dyn_cast<amdgpu::AsyncCopyLocalToGlobalOp>(op)) {
     int contig = LLVM::AMD::getVectorSize(copyOp.getDst(), axisInfo);
-    return getNumberOfAsyncCopyInstructions(copyOp.getDst().getType(),
-                                            copyOp.getSrc().getType(),
-                                            copyOp.getMask(), contig, axisInfo);
+    return getNumberOfAsyncCopyInstructions(
+        copyOp.getDst().getType(), copyOp.getSrc().getType(), copyOp.getMask(),
+        contig, copyOp.getContiguity(), axisInfo, targetFeatures,
+        /*isStore=*/true);
   } else if (emitRemarkOnNonAsyncOp) {
     SmallVector<mlir::MemoryEffects::EffectInstance> effects;
     if (auto memEffectIface = dyn_cast<MemoryEffectOpInterface>(op))
@@ -133,9 +181,13 @@ int getOpNumberOfAsyncCopyInstructions(Operation *op,
 //      ops already visited with the same number of outstanding ops. This
 //      prevents infinite recursion depths for loops without ops contributing
 // - `countFunc`: called on ops to determine if they contribute to the pathSum
+// - `countCommitGroups`: if true, decrement on AsyncCommitGroupOp (for commit
+//      group counting); if false, decrement numOutstanding when countFunc
+//      returns non-zero (for instruction counting).
 // TODO: walk static loops correctly to avoid conservative loops. (static loops
 // from Gluon are unrolled right now)
 using MemoCache = llvm::DenseSet<std::tuple<Operation *, int, int>>;
+template <bool countCommitGroups>
 int computeMinCountBackward(Operation *cursor, Operation *cameFrom,
                             int numOutstanding, int pathSum, int bestPath,
                             MemoCache &branchStateCache,
@@ -143,7 +195,7 @@ int computeMinCountBackward(Operation *cursor, Operation *cameFrom,
   assert(cameFrom != nullptr);
   // Step to the previous op within the current block; if none, step to
   // the parent op. Stop at the module since it asserts on ->getPrevNode().
-  auto getPredecessor = [&cameFrom](Operation *op) {
+  auto getPredecessor = [](Operation *op) {
     auto prevOp = op->getPrevNode();
     if (!prevOp) {
       prevOp = op->getParentOp();
@@ -159,9 +211,9 @@ int computeMinCountBackward(Operation *cursor, Operation *cameFrom,
   // leading to a higher sum; repeated calls will return monotonically
   // decreasing values
   auto continueWalkFrom = [&](Operation *newCursor) {
-    auto pathResult =
-        computeMinCountBackward(newCursor, cursor, numOutstanding, pathSum,
-                                bestPath, branchStateCache, countFunc);
+    auto pathResult = computeMinCountBackward<countCommitGroups>(
+        newCursor, cursor, numOutstanding, pathSum, bestPath, branchStateCache,
+        countFunc);
     bestPath = std::min(bestPath, pathResult);
     return pathResult;
   };
@@ -259,9 +311,18 @@ int computeMinCountBackward(Operation *cursor, Operation *cameFrom,
     }
 
     // Non-control-flow ops: keep walking and accumulate via countFunc
-    pathSum += countFunc(cursor);
-    if (isa<ttg::AsyncCommitGroupOp>(cursor)) {
-      numOutstanding--;
+    int count = countFunc(cursor);
+    pathSum += count;
+
+    // Decrement numOutstanding based on counting mode
+    if constexpr (countCommitGroups) {
+      if (isa<ttg::AsyncCommitGroupOp>(cursor))
+        numOutstanding--;
+    } else {
+      // For instruction counting: decrement when we find an operation that
+      // emits instructions
+      if (count > 0)
+        numOutstanding--;
     }
 
     cameFrom = cursor;
@@ -271,13 +332,27 @@ int computeMinCountBackward(Operation *cursor, Operation *cameFrom,
   return std::min(pathSum, bestPath);
 }
 
-// Overload for ease of use with AsyncWait, see documentation above
+// Overload for ease of use with AsyncWait (counts commit groups)
 int computeMinCountBackward(ttg::AsyncWaitOp waitOp,
                             llvm::function_ref<int(Operation *)> countFunc) {
   MemoCache memoCache;
-  return computeMinCountBackward(waitOp, waitOp, waitOp.getNum(), 0,
-                                 std::numeric_limits<int>::max(), memoCache,
-                                 countFunc);
+  return computeMinCountBackward</*countCommitGroups=*/true>(
+      waitOp, waitOp, waitOp.getNum(), 0, std::numeric_limits<int>::max(),
+      memoCache, countFunc);
+}
+
+// Overload for ease of use with AsyncTDMWait (counts TDM instructions)
+int computeMinCountBackward(triton::amdgpu::AsyncTDMWait waitOp,
+                            llvm::function_ref<int(Operation *)> countFunc) {
+  MemoCache memoCache;
+  // `computeMinCountBackward` expects `numOutstanding` to be the number of
+  // outstanding ops to wait on. Since `AsyncTDMWait` counts the number of TDM
+  // ops to wait on, we have to subtract 1 to stop before the n'th op is
+  // reached.
+  int numOutstanding = static_cast<int>(waitOp.getNum()) - 1;
+  return computeMinCountBackward</*countCommitGroups=*/false>(
+      waitOp, waitOp, numOutstanding, 0, std::numeric_limits<int>::max(),
+      memoCache, countFunc);
 }
 
 // Follows the tokens of waitOp or walks the IR backwards from waitOp and
@@ -301,14 +376,10 @@ void updateWaitCount(WaitType waitOp,
       waitCnt = std::min(waitCnt, tokenWaitCnt);
     }
   } else {
-    // For AsyncWait we have to count the actual intrinsics instead of
-    // ttgir ops. For TDM wait this is not required as each tdm load will emit
-    // exactly one tensor load so we can keep the count.
-    if constexpr (std::is_same_v<WaitType, ttg::AsyncWaitOp>) {
-      waitCnt = computeMinCountBackward(waitOp, computeCountForOp);
-    } else {
-      waitCnt = waitOp.getNum();
-    }
+    // For tokenless waits we treat `num` as the number:
+    // - ttg.async_wait: number of outstanding commit groups
+    // - amdg.async_tdm_wait: number of outstanding TDM operations
+    waitCnt = computeMinCountBackward(waitOp, computeCountForOp);
   }
 
   if (waitCnt == std::numeric_limits<int>::max()) {
@@ -317,16 +388,31 @@ void updateWaitCount(WaitType waitOp,
   }
 
   if (std::is_same_v<WaitType, ttg::AsyncWaitOp>) {
-    // Replace ttg.async_wait which counts outstanding commits groups with
-    // amdg.async_wait which counts the number of oustanding
-    // intrinsics
+    // Replace ttg.async_wait which counts outstanding commit groups with
+    // amdg.async_wait which counts the number of outstanding intrinsics
     auto tokens = waitOp.getAsyncToken();
+    auto origNum = waitOp.getNum();
     rewriter.setInsertionPointAfter(waitOp);
-    rewriter.replaceOpWithNewOp<amdgpu::AsyncWaitOp>(waitOp, tokens, waitCnt);
+    auto newOp = rewriter.replaceOpWithNewOp<amdgpu::AsyncWaitOp>(
+        waitOp, tokens, waitCnt);
+    // Preserve the original commit-group count so downstream passes
+    // (e.g. ConcurrencySanitizer) that reason about commit groups can
+    // still access it after this lowering.
+    newOp->setAttr("ttg.num_commit_groups",
+                   rewriter.getI32IntegerAttr(origNum));
+  } else if (std::is_same_v<WaitType, triton::amdgpu::AsyncTDMWait>) {
+    // Replace amdg.async_tdm_wait (counts TDM operations) with
+    // amdg.async_tdm_intrinsic_wait (counts TDM intrinsics)
+    auto tokens = waitOp.getAsyncToken();
+    auto origNum = waitOp.getNum();
+    rewriter.setInsertionPointAfter(waitOp);
+    auto newOp = rewriter.replaceOpWithNewOp<amdgpu::AsyncTDMIntrinsicWait>(
+        waitOp, tokens, waitCnt);
+    // Preserve the original TDM operation count so downstream passes
+    // (e.g. ConcurrencySanitizer) can still access it after this lowering.
+    newOp->setAttr("ttg.num_tdm_ops", rewriter.getI32IntegerAttr(origNum));
   } else {
-    // For TDM each TTGIR op will create exactly one intrinsics so we do not use
-    // a separate op
-    rewriter.modifyOpInPlace(waitOp, [&]() { waitOp.setNum(waitCnt); });
+    assert(false && "Unsupported wait type");
   }
 }
 
@@ -338,52 +424,88 @@ struct TritonAMDGPUUpdateAsyncWaitCountPass
   using Base::Base;
 
   void runOnOperation() override {
-    tt::AMD::TargetInfo targetInfo(archGenerationName);
-    if (!isCDNA(targetInfo.getISAFamily()) &&
-        targetInfo.getISAFamily() != tt::AMD::ISAFamily::GFX1250) {
+    TargetFeatures targetFeatures{llvm::StringRef(gfxArch)};
+    if (!targetFeatures.isCDNA() && !targetFeatures.isGFX1250()) {
       return;
-    }
-
-    // For HW which does not support async loads (GFX9) but only direct-to-lds,
-    // we still use the waitcnt to support interleaving of direct-to-lds loads
-    // when pipelining. The flag is used to emit warnings in case we find
-    // tt.loads/store which make the computed count conservative and hinder
-    // performance.
-    bool supportsAsyncLoads = true;
-    switch (targetInfo.getISAFamily()) {
-    case triton::AMD::ISAFamily::CDNA3:
-    case triton::AMD::ISAFamily::CDNA4:
-      supportsAsyncLoads = false;
-      break;
-    default:
-      break;
     }
 
     ModuleOp m = getOperation();
 
-    // ttg.async_wait should only count async **non** tdm load:
-    SmallVector<ttg::AsyncWaitOp> waitOps;
-    getOperation()->walk(
-        [&](ttg::AsyncWaitOp waitOp) { waitOps.push_back(waitOp); });
+    // With asyncmark/wait_asyncmark, LLVM handles vmcnt computation —
+    // Triton no longer needs to walk the IR and count outstanding async
+    // intrinsics. Keep the ttg.async_wait ops unchanged (they track
+    // commit groups) and lower them directly to wait_asyncmark later.
+    if (!targetFeatures.useAsyncMarks()) {
+      // GFX1250 (and future arches without asyncmark) use instruction counting.
+      SmallVector<ttg::AsyncWaitOp> waitOps;
+      getOperation()->walk(
+          [&](ttg::AsyncWaitOp waitOp) { waitOps.push_back(waitOp); });
 
-    ModuleAxisInfoAnalysis axisInfo(m);
-    // Cache #intrinsic per asyc op to avoid expensive recomputations
-    DenseMap<Operation *, int> intrinsicCountCache;
-    auto countAsyncLoadInstructions = [&](Operation *op) {
-      auto found = intrinsicCountCache.find(op);
-      if (found != intrinsicCountCache.end()) {
+      ModuleAxisInfoAnalysis axisInfo(m);
+      DenseMap<Operation *, int> intrinsicCountCache;
+      auto countAsyncLoadInstructions = [&](Operation *op) -> int {
+        auto found = intrinsicCountCache.find(op);
+        if (found != intrinsicCountCache.end()) {
+          return found->second;
+        }
+        auto v = getOpNumberOfAsyncCopyInstructions(
+            op, targetFeatures, axisInfo,
+            /*emitRemarkOnNonAsyncOp=*/false);
+        intrinsicCountCache[op] = v;
+        return v;
+      };
+
+      for (auto waitOp : waitOps) {
+        IRRewriter builder(waitOp->getContext());
+        updateWaitCount(waitOp, countAsyncLoadInstructions, builder);
+      }
+    }
+
+    // amdgpu.AsyncTDMWait should only count async tdm ops
+    SmallVector<triton::amdgpu::AsyncTDMWait> waitTDMOps;
+    getOperation()->walk([&](triton::amdgpu::AsyncTDMWait waitOp) {
+      waitTDMOps.push_back(waitOp);
+    });
+
+    DenseMap<Operation *, int> tdmIntrinsicCountCache;
+    auto countTDMInstructions = [&](Operation *op) -> int {
+      auto found = tdmIntrinsicCountCache.find(op);
+      if (found != tdmIntrinsicCountCache.end()) {
         return found->second;
       }
-      auto v = getOpNumberOfAsyncCopyInstructions(op, targetInfo, axisInfo,
-                                                  !supportsAsyncLoads);
-      intrinsicCountCache[op] = v;
+
+      auto v = [&]() -> int {
+        using namespace triton::amdgpu;
+        if (auto copyOp = dyn_cast<AsyncTDMCopyGlobalToLocalOp>(op)) {
+          auto smemTy = copyOp.getResult().getType();
+          int numWarps = ttg::lookupNumWarps(op);
+          auto [_, numInstr] =
+              mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+                  smemTy.getShape(), numWarps, smemTy.getEncoding());
+          return numInstr;
+        } else if (auto copyOp = dyn_cast<AsyncTDMCopyLocalToGlobalOp>(op)) {
+          auto smemTy = copyOp.getSrc().getType();
+          int numWarps = ttg::lookupNumWarps(op);
+          auto [_, numInstr] =
+              mlir::LLVM::AMD::distributeTDMWarpsAlignToPartition(
+                  smemTy.getShape(), numWarps, smemTy.getEncoding());
+          return numInstr;
+        } else if (isa<AsyncTDMScatterOp, AsyncTDMGatherOp>(op)) {
+          auto rowIndicesType =
+              cast<RankedTensorType>(op->getOperandTypes()[1]);
+          return mlir::LLVM::AMD::getTDMGatherScatterInstrinsicCount(
+              rowIndicesType);
+        } else {
+          return 0;
+        }
+      }();
+      tdmIntrinsicCountCache[op] = v;
       return v;
     };
 
-    // Note: AsyncWaits should ignore TDM ops; different HW counter
-    for (auto waitOp : waitOps) {
+    for (auto waitOp : waitTDMOps) {
       IRRewriter builder(waitOp->getContext());
-      updateWaitCount(waitOp, countAsyncLoadInstructions, builder);
+      updateWaitCount(waitOp, countTDMInstructions, builder);
     }
   }
 };
